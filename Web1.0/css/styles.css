@@ -1,0 +1,19 @@
+/* Web 1.0 inspired styles — simple, boxed layout, system fonts */
+html,body{height:100%;margin:0;padding:0;background:#cfe3ff;font-family: "Times New Roman", Times, serif;color:#000}
+#container{width:900px;margin:20px auto;background:#fff;border:4px solid #000;padding:16px;box-shadow:6px 6px 0 rgba(0,0,0,0.15)}
+header{text-align:left}
+#logo{height:64px;vertical-align:middle;float:right}
+h1{margin:6px 0 0 0;font-size:28px}
+.tagline{font-size:12px;color:#333;margin-top:4px}
+nav{background:#e6f0ff;border:2px inset #999;padding:8px;margin:12px 0}
+nav ul{list-style:none;padding:0;margin:0;display:flex;gap:12px}
+nav a{color:#000;text-decoration:none;font-weight:bold}
+main{clear:both}
+section{margin-bottom:18px}
+.konto-table{width:100%;border-collapse:collapse}
+.konto-table th,.konto-table td{border:2px solid #000;padding:8px;background:#fff}
+.services-list{list-style:disc;margin-left:20px}
+aside{border:2px dashed #666;padding:8px;margin-top:8px;background:#fff}
+footer{text-align:center;margin-top:12px;font-size:12px}
+/* Retro button look (links) */
+a.btn{display:inline-block;padding:6px 10px;border:2px outset #ccc;background:#f2f2f2;text-decoration:none;color:#000}
