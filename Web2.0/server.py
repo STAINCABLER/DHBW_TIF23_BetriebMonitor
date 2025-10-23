@@ -230,6 +230,21 @@ class MemoryStore:
             raise KeyError("Benutzer nicht gefunden")
         self._users[username][field] = value
 
+    def delete_user(self, username: str) -> None:
+        if username not in self._users:
+            raise KeyError("Benutzer nicht gefunden")
+        user = self._users.pop(username)
+        self._transactions.pop(username, None)
+        email = str(user.get("email") or "").strip().lower()
+        iban = str(user.get("iban") or "").replace(" ", "").upper()
+        if email:
+            self._email_index.pop(email, None)
+        if iban:
+            self._iban_index.pop(iban, None)
+        for token, session in list(self._sessions.items()):
+            if session.get("username") == username:
+                self._sessions.pop(token, None)
+
     # Transaktionen ------------------------------------------------------
     def append_transaction(self, username: str, txn: Dict[str, Any]) -> None:
         self._transactions.setdefault(username, []).insert(0, txn)
@@ -325,6 +340,19 @@ class UpstashStore:
         if not self.user_exists(username):
             raise KeyError("Benutzer nicht gefunden")
         self._client.hset(self._user_key(username), field=field, value=value)
+
+    def delete_user(self, username: str) -> None:
+        user = self.get_user(username)
+        if not user:
+            raise KeyError("Benutzer nicht gefunden")
+        email = str(user.get("email") or "").strip().lower()
+        iban = str(user.get("iban") or "").replace(" ", "").upper()
+        self._client.delete(self._user_key(username))
+        self._client.delete(self._txn_key(username))
+        if email:
+            self._client.delete(self._email_key(email))
+        if iban:
+            self._client.delete(self._iban_key(iban))
 
     def append_transaction(self, username: str, txn: Dict[str, Any]) -> None:
         self._client.lpush(self._txn_key(username), json.dumps(txn))
@@ -639,6 +667,45 @@ def account_me() -> Any:
             "advisor": advisor_profile,
         }
     )
+
+
+@app.delete("/api/accounts/me")
+def account_delete() -> Any:
+    try:
+        username = _require_auth()
+    except PermissionError as exc:
+        return _error(str(exc), 401)
+
+    payload = request.get_json(force=True, silent=True) or {}
+    try:
+        confirm_iban = _clean_iban(payload.get("confirmIban"))
+    except ValueError as exc:
+        return _error(str(exc))
+
+    user = store.get_user(username)
+    if not user:
+        return _error("Benutzer nicht gefunden", 404)
+
+    stored_iban = str(user.get("iban") or "").replace(" ", "").upper()
+    if not stored_iban:
+        return _error("IBAN fehlt für dieses Konto", 400)
+    if confirm_iban != stored_iban:
+        return _error("IBAN stimmt nicht überein", 400)
+
+    deleter = getattr(store, "delete_user", None)
+    if deleter is None:
+        return _error("Kontolöschung derzeit nicht möglich", 500)
+
+    try:
+        deleter(username)
+    except KeyError as exc:
+        return _error(str(exc), 404)
+
+    token = request.environ.get("session_token")
+    if token:
+        store.delete_session(token)
+
+    return jsonify({"success": True})
 
 
 def _record_transaction(

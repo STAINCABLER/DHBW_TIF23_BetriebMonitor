@@ -48,6 +48,9 @@ const elements = {
   accountSettingsFeedback: qs('#accountSettingsFeedback'),
   profileForm: qs('#profileForm'),
   passwordForm: qs('#passwordForm'),
+  accountDeleteForm: qs('#accountDeleteForm'),
+  accountDeleteIbanInput: qs('#accountDeleteIban'),
+  accountDeleteIbanHint: qs('#accountDeleteIbanHint'),
   settingsTabButtons: qa('[data-settings-tab]'),
   settingsPanels: qa('[data-settings-panel]'),
   accountHolder: qs('#accountHolder'),
@@ -364,6 +367,7 @@ function clearSession(options = { silent: false }) {
   updateBalances();
   updateAccountMeta();
   updateAdvisorCard();
+  populateAccountSettingsForms();
   updateAutoRefreshIndicator();
   closeTransactionModal();
   if (!options.silent) {
@@ -880,6 +884,10 @@ function setAccountSettingsFeedback(message = '', type = 'info') {
 }
 
 function populateAccountSettingsForms() {
+  if (elements.accountDeleteIbanHint) {
+    const formattedIban = formatIbanForDisplay(state.account?.iban) || '–';
+    elements.accountDeleteIbanHint.textContent = formattedIban;
+  }
   if (!state.account) {
     return;
   }
@@ -929,6 +937,7 @@ function openAccountSettings() {
   }
   populateAccountSettingsForms();
   elements.passwordForm?.reset();
+  elements.accountDeleteForm?.reset();
   setAccountSettingsFeedback('');
   switchAccountSettingsTab('profile');
   elements.accountSettingsModal.classList.remove('hidden');
@@ -1030,6 +1039,60 @@ function attachAccountSettingsHandlers() {
       showToast(error.message, 'error');
     } finally {
       setFormBusy(elements.passwordForm, false);
+    }
+  });
+
+  elements.accountDeleteIbanInput?.addEventListener('input', () => {
+    const input = elements.accountDeleteIbanInput;
+    if (!input) {
+      return;
+    }
+    const raw = sanitizeIban(input.value);
+    const grouped = raw.match(/.{1,4}/g)?.join(' ') ?? raw;
+    input.value = grouped;
+  });
+
+  elements.accountDeleteForm?.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    if (!state.token) {
+      openModal('login');
+      return;
+    }
+    const formData = getFormValues(elements.accountDeleteForm);
+    const confirmIban = sanitizeIban(formData.confirmIban);
+    const accountIban = sanitizeIban(state.account?.iban);
+    if (!confirmIban) {
+      setAccountSettingsFeedback('Bitte gib deine IBAN ein.', 'error');
+      return;
+    }
+    if (confirmIban.length !== 22) {
+      setAccountSettingsFeedback('IBAN muss vollständig angegeben werden.', 'error');
+      return;
+    }
+    if (!accountIban) {
+      setAccountSettingsFeedback('Konto-IBAN konnte nicht geladen werden.', 'error');
+      return;
+    }
+    if (confirmIban !== accountIban) {
+      setAccountSettingsFeedback('IBAN stimmt nicht mit deinem Konto überein.', 'error');
+      return;
+    }
+    setAccountSettingsFeedback('');
+    setFormBusy(elements.accountDeleteForm, true);
+    try {
+      await apiFetch('/api/accounts/me', {
+        method: 'DELETE',
+        body: { confirmIban },
+      });
+      showToast('Dein Konto wurde gelöscht.', 'success');
+      elements.accountDeleteForm.reset();
+      clearSession({ silent: true });
+      closeAccountSettings();
+    } catch (error) {
+      setAccountSettingsFeedback(error.message, 'error');
+      showToast(error.message, 'error');
+    } finally {
+      setFormBusy(elements.accountDeleteForm, false);
     }
   });
 }

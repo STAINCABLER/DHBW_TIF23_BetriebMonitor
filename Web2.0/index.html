@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>AlteBank - Digitale Filiale</title>
-  <link rel="stylesheet" href="css/styles.css?v=20251023c">
+  <link rel="stylesheet" href="css/styles.css?v=20251024a">
   <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
 </head>
 <body>
@@ -404,6 +404,7 @@
         <div class="settings-tabs" role="tablist" aria-label="Kontoeinstellungen">
           <button type="button" id="settingsTabProfile" class="settings-tab" role="tab" data-settings-tab="profile" aria-controls="profileForm">Persönliche Daten</button>
           <button type="button" id="settingsTabPassword" class="settings-tab" role="tab" data-settings-tab="password" aria-controls="passwordForm">Passwort ändern</button>
+          <button type="button" id="settingsTabDelete" class="settings-tab" role="tab" data-settings-tab="delete" aria-controls="accountDeleteForm">Konto löschen</button>
         </div>
         <div class="settings-panels">
           <form id="profileForm" class="settings-form" role="tabpanel" aria-labelledby="settingsTabProfile" data-settings-panel="profile" autocomplete="on">
@@ -439,6 +440,14 @@
             </div>
             <button type="submit" class="btn btn--outline">Passwort aktualisieren</button>
           </form>
+          <form id="accountDeleteForm" class="settings-card settings-card--danger hidden" role="tabpanel" aria-labelledby="settingsTabDelete" data-settings-panel="delete" autocomplete="off">
+            <h3>Konto endgültig löschen</h3>
+            <p class="settings-card__lead">Dieser Schritt entfernt dein Konto dauerhaft, inklusive aller Transaktionen und Beraterzuordnungen. Die Aktion kann nicht rückgängig gemacht werden.</p>
+            <p class="settings-card__iban">Zur Bestätigung gib deine IBAN ein: <strong id="accountDeleteIbanHint">–</strong></p>
+            <label for="accountDeleteIban">Eigene IBAN bestätigen</label>
+            <input type="text" id="accountDeleteIban" name="confirmIban" inputmode="text" maxlength="34" placeholder="DE00 1234 5678 9012 3456 78" required>
+            <button type="submit" class="btn btn--danger">Konto löschen</button>
+          </form>
         </div>
       </div>
       <div id="accountSettingsFeedback" class="form-feedback" role="status" aria-live="polite"></div>
@@ -448,6 +457,6 @@
   <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
 
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.6/dist/chart.umd.min.js" integrity="sha384-FZ0gCG8FDXZqNv3UNwcwNsO/at/0Aa5hkl4G3sqvjqhnaAVBkxzZ0ZFXOwSWm3Bg" crossorigin="anonymous"></script>
-  <script type="module" src="assets/app.js?v=20251023c"></script>
+  <script type="module" src="assets/app.js?v=20251024a"></script>
 </body>
 </html>

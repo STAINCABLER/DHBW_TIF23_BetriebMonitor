@@ -73,6 +73,11 @@
   text-transform: uppercase;
   letter-spacing: 0.08em;
 }
+
+#accountDeleteIban {
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
 :root {
   color-scheme: light;
   --color-bg: #f5f7fb;
@@ -378,6 +383,18 @@ main {
 .btn--link {
   background: none;
   border: none;
+.btn--danger {
+  background: rgba(220, 38, 38, 0.12);
+  border: 1px solid rgba(220, 38, 38, 0.35);
+  color: var(--color-negative);
+}
+
+.btn--danger:hover,
+.btn--danger:focus-visible {
+  background: rgba(220, 38, 38, 0.18);
+  border-color: rgba(220, 38, 38, 0.55);
+}
+
   padding: 0;
   color: var(--color-primary);
   font-weight: 600;
@@ -837,6 +854,44 @@ main {
 
 .settings-form .btn {
   align-self: flex-start;
+}
+
+.settings-card {
+  width: min(100%, 520px);
+  background: #fff2f2;
+  border-radius: var(--radius-md);
+  border: 1px solid rgba(220, 38, 38, 0.2);
+  box-shadow: var(--shadow-md);
+  padding: 1.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.settings-card--danger {
+  background: #fff5f5;
+  border-color: rgba(220, 38, 38, 0.3);
+}
+
+.settings-card .btn {
+  align-self: flex-start;
+}
+
+.settings-card__lead {
+  margin: 0;
+  color: rgba(15, 23, 42, 0.75);
+  font-size: 0.9rem;
+}
+
+.settings-card__iban {
+  margin: 0;
+  font-size: 0.85rem;
+  color: var(--color-muted);
+}
+
+.settings-card__iban strong {
+  letter-spacing: 0.08em;
+  color: var(--color-text);
 }
 
 .actions-grid {
