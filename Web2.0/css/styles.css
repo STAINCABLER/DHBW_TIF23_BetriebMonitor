@@ -1051,6 +1051,17 @@ input:focus-visible {
   color: var(--color-muted);
 }
 
+.site-footer a {
+  color: var(--color-primary);
+  text-decoration: none;
+  font-weight: 600;
+}
+
+.site-footer a:hover,
+.site-footer a:focus-visible {
+  text-decoration: underline;
+}
+
 .modal {
   position: fixed;
   inset: 0;
