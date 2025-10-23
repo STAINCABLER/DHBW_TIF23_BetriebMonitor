@@ -90,8 +90,6 @@
   --radius-lg: 24px;
   --radius-md: 16px;
   --radius-sm: 10px;
-  --brand-logo-size: 48px;
-  --brand-logo-offset: -24px;
   font-family: "Inter", "Segoe UI", "Roboto", "Helvetica Neue", Arial, sans-serif;
 }
 
@@ -172,9 +170,9 @@ main {
   display: flex;
   align-items: center;
   justify-content: center;
-  width: var(--brand-logo-size, 48px);
-  height: var(--brand-logo-size, 48px);
-  margin-left: var(--brand-logo-offset, -24px);
+  width: 48px;
+  height: 48px;
+  margin-left: -24px;
   flex-shrink: 0;
   position: relative;
 }
@@ -189,6 +187,7 @@ main {
   display: flex;
   flex-direction: column;
   gap: 0.2rem;
+  align-items: flex-start;
 }
 
 .brand__name {

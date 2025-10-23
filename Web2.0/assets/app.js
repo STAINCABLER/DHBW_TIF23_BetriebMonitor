@@ -30,6 +30,7 @@ const elements = {
   brand: qs('.brand'),
   brandLogoWrapper: qs('.brand__logo-wrapper'),
   brandTextBlock: qs('.brand__text'),
+  topNav: qs('.top-nav'),
   guestNav: qs('#guestNav'),
   userNav: qs('#userNav'),
   navSectionButtons: qa('[data-nav-section]'),
@@ -105,6 +106,7 @@ let autoRefreshTimer = null;
 let loadAccountInFlight = null;
 let lastRefreshAt = null;
 let balanceChartInstance = null;
+let brandLogoRaf = null;
 
 function showToast(message, type = 'info') {
   if (!elements.toast) return;
@@ -153,22 +155,35 @@ function syncBodyScrollLock() {
 }
 
 function syncBrandLogoSize() {
-  const brand = elements.brand;
-  const textBlock = elements.brandTextBlock;
-  if (!brand || !textBlock) {
-    return;
+  if (brandLogoRaf) {
+    window.cancelAnimationFrame(brandLogoRaf);
   }
+  brandLogoRaf = window.requestAnimationFrame(() => {
+    brandLogoRaf = null;
+    const nav = elements.topNav;
+    const wrapper = elements.brandLogoWrapper;
+    if (!nav || !wrapper) {
+      return;
+    }
 
-  const textRect = textBlock.getBoundingClientRect();
-  const textHeight = textRect.height;
-  if (!textHeight) {
-    return;
-  }
+    const navHeight = Math.max(0, nav.getBoundingClientRect().height || 0);
+    if (!navHeight) {
+      return;
+    }
 
-  const targetSize = Math.max(32, textHeight - 10);
-  const offset = -Math.max(12, Math.round(targetSize * 0.35));
-  brand.style.setProperty('--brand-logo-size', `${targetSize}px`);
-  brand.style.setProperty('--brand-logo-offset', `${offset}px`);
+    const logo = wrapper.querySelector('.brand__logo');
+    const naturalWidth = logo?.naturalWidth || 0;
+    const naturalHeight = logo?.naturalHeight || 0;
+    const aspectRatio = naturalWidth > 0 && naturalHeight > 0 ? naturalWidth / naturalHeight : 1;
+
+  const targetHeight = Math.max(36, Math.round(navHeight * 0.44));
+    const targetWidth = Math.max(36, Math.round(targetHeight * aspectRatio));
+    const offset = -Math.round(targetWidth * 0.25);
+
+    wrapper.style.height = `${targetHeight}px`;
+    wrapper.style.width = `${targetWidth}px`;
+    wrapper.style.marginLeft = `${offset}px`;
+  });
 }
 
 function activateSection(key, { scroll = true } = {}) {
@@ -322,6 +337,7 @@ function updateAuthState(isAuthenticated, profile, options = {}) {
       button.setAttribute('aria-pressed', 'false');
     });
   }
+  syncBrandLogoSize();
 }
 
 function clearSession(options = { silent: false }) {
@@ -1429,6 +1445,19 @@ function init() {
     });
   } else {
     window.setTimeout(syncBrandLogoSize, 0);
+  }
+  if (typeof ResizeObserver !== 'undefined') {
+    const target = elements.topNav || elements.brandTextBlock;
+    if (target) {
+      const observer = new ResizeObserver(() => syncBrandLogoSize());
+      observer.observe(target);
+    }
+  }
+  const logoImg = elements.brandLogoWrapper?.querySelector('.brand__logo');
+  if (logoImg && !logoImg.complete) {
+    logoImg.addEventListener('load', () => {
+      syncBrandLogoSize();
+    }, { once: true });
   }
   updateAuthState(Boolean(state.token), state.account);
   updateBalances();
