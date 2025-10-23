@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="160" height="160" viewBox="0 0 160 160">
+  <defs>
+    <linearGradient id="advisorGradientThree" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1d4ed8" />
+      <stop offset="100%" stop-color="#f97316" />
+    </linearGradient>
+  </defs>
+  <rect width="160" height="160" rx="80" fill="url(#advisorGradientThree)" />
+  <text x="80" y="92" font-family="'Segoe UI', Arial, sans-serif" font-size="52" font-weight="600" fill="#ffffff" text-anchor="middle">NH</text>
+</svg>
