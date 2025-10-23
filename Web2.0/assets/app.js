@@ -41,6 +41,7 @@ const elements = {
   landing: qs('.landing'),
   guestActions: qs('#guestActions'),
   userActions: qs('#userActions'),
+  sessionTimer: qs('#sessionTimer'),
   userInitial: qs('#userInitial'),
   currentUser: qs('#currentUser'),
   openAccountSettingsBtn: qs('[data-open-account-settings]'),
@@ -103,6 +104,11 @@ const ADVISOR_FALLBACK = {
 
 const euro = new Intl.NumberFormat('de-DE', { style: 'currency', currency: 'EUR' });
 const AUTO_REFRESH_INTERVAL = 15000;
+const INACTIVITY_TIMEOUT_MS = 5 * 60 * 1000;
+const INACTIVITY_WARNING_THRESHOLD_MS = 60 * 1000;
+const ACTIVITY_RESET_THROTTLE_MS = 1500;
+const INACTIVITY_EVENTS = ['pointerdown', 'pointermove', 'keydown', 'touchstart', 'wheel'];
+const INACTIVITY_EVENT_OPTIONS = { passive: true };
 
 let toastTimer = null;
 let autoRefreshTimer = null;
@@ -110,6 +116,11 @@ let loadAccountInFlight = null;
 let lastRefreshAt = null;
 let balanceChartInstance = null;
 let brandLogoRaf = null;
+let inactivityTimeoutId = null;
+let inactivityIntervalId = null;
+let inactivityDeadline = null;
+let inactivityListenersAttached = false;
+let lastActivityResetAt = 0;
 
 function showToast(message, type = 'info') {
   if (!elements.toast) return;
@@ -187,6 +198,128 @@ function syncBrandLogoSize() {
     wrapper.style.width = `${targetWidth}px`;
     wrapper.style.marginLeft = `${offset}px`;
   });
+}
+
+function updateSessionTimerDisplay() {
+  if (!elements.sessionTimer) {
+    return;
+  }
+  if (!state.token || !inactivityDeadline) {
+    elements.sessionTimer.textContent = '';
+    elements.sessionTimer.classList.add('hidden');
+    elements.sessionTimer.classList.remove('session-timer--warning');
+    elements.sessionTimer.removeAttribute('title');
+    elements.sessionTimer.removeAttribute('aria-label');
+    return;
+  }
+
+  const remainingMs = Math.max(0, inactivityDeadline - Date.now());
+  const totalSeconds = Math.max(0, Math.ceil(remainingMs / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  const formatted = `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+
+  elements.sessionTimer.textContent = formatted;
+  elements.sessionTimer.classList.remove('hidden');
+  elements.sessionTimer.classList.toggle('session-timer--warning', remainingMs <= INACTIVITY_WARNING_THRESHOLD_MS);
+
+  const minuteLabel = minutes === 1 ? '1 Minute' : `${minutes} Minuten`;
+  const secondLabel = seconds === 1 ? '1 Sekunde' : `${seconds} Sekunden`;
+  let readable;
+  if (totalSeconds === 0) {
+    readable = 'wenigen Sekunden';
+  } else if (minutes === 0) {
+    readable = secondLabel;
+  } else if (seconds === 0) {
+    readable = minuteLabel;
+  } else {
+    readable = `${minuteLabel} und ${secondLabel}`;
+  }
+  elements.sessionTimer.setAttribute('aria-label', `Automatische Abmeldung in ${readable}`);
+  elements.sessionTimer.setAttribute('title', `Auto-Logout in ${formatted}`);
+}
+
+function stopInactivityTimer() {
+  if (inactivityTimeoutId) {
+    window.clearTimeout(inactivityTimeoutId);
+    inactivityTimeoutId = null;
+  }
+  if (inactivityIntervalId) {
+    window.clearInterval(inactivityIntervalId);
+    inactivityIntervalId = null;
+  }
+  inactivityDeadline = null;
+  lastActivityResetAt = 0;
+  if (elements.sessionTimer) {
+    elements.sessionTimer.textContent = '';
+    elements.sessionTimer.classList.add('hidden');
+    elements.sessionTimer.classList.remove('session-timer--warning');
+    elements.sessionTimer.removeAttribute('title');
+    elements.sessionTimer.removeAttribute('aria-label');
+  }
+}
+
+function handleInactivityLogout() {
+  stopInactivityTimer();
+  if (!state.token) {
+    return;
+  }
+  clearSession({ silent: true });
+  showToast('Du wurdest wegen Inaktivität abgemeldet.', 'info');
+}
+
+function resetInactivityTimer() {
+  if (!state.token) {
+    stopInactivityTimer();
+    return;
+  }
+  const now = Date.now();
+  lastActivityResetAt = now;
+  inactivityDeadline = now + INACTIVITY_TIMEOUT_MS;
+
+  if (inactivityTimeoutId) {
+    window.clearTimeout(inactivityTimeoutId);
+  }
+  if (inactivityIntervalId) {
+    window.clearInterval(inactivityIntervalId);
+  }
+
+  inactivityTimeoutId = window.setTimeout(handleInactivityLogout, INACTIVITY_TIMEOUT_MS);
+  inactivityIntervalId = window.setInterval(updateSessionTimerDisplay, 1000);
+  updateSessionTimerDisplay();
+}
+
+function handleUserActivity() {
+  if (!state.token) {
+    return;
+  }
+  const now = Date.now();
+  if (now - lastActivityResetAt < ACTIVITY_RESET_THROTTLE_MS) {
+    return;
+  }
+  resetInactivityTimer();
+}
+
+function attachInactivityListeners() {
+  if (inactivityListenersAttached) {
+    return;
+  }
+  INACTIVITY_EVENTS.forEach((event) => {
+    document.addEventListener(event, handleUserActivity, INACTIVITY_EVENT_OPTIONS);
+  });
+  window.addEventListener('focus', handleUserActivity);
+  inactivityListenersAttached = true;
+}
+
+function detachInactivityListeners() {
+  if (!inactivityListenersAttached) {
+    return;
+  }
+  INACTIVITY_EVENTS.forEach((event) => {
+    document.removeEventListener(event, handleUserActivity, INACTIVITY_EVENT_OPTIONS);
+  });
+  window.removeEventListener('focus', handleUserActivity);
+  inactivityListenersAttached = false;
 }
 
 function activateSection(key, { scroll = true } = {}) {
@@ -328,6 +461,12 @@ function updateAuthState(isAuthenticated, profile, options = {}) {
       state.activeSection = 'overview';
     }
     activateSection(state.activeSection, { scroll: !preserveSection || !wasAuthenticated });
+    attachInactivityListeners();
+    if (!wasAuthenticated) {
+      resetInactivityTimer();
+    } else {
+      updateSessionTimerDisplay();
+    }
   } else {
     elements.guestActions?.classList.remove('hidden');
     elements.userActions?.classList.add('hidden');
@@ -339,12 +478,16 @@ function updateAuthState(isAuthenticated, profile, options = {}) {
       button.classList.remove('is-active');
       button.setAttribute('aria-pressed', 'false');
     });
+    stopInactivityTimer();
+    detachInactivityListeners();
   }
   syncBrandLogoSize();
 }
 
 function clearSession(options = { silent: false }) {
   stopAutoRefresh();
+  stopInactivityTimer();
+  detachInactivityListeners();
   state.token = null;
   state.account = null;
   state.transactions = [];
@@ -1553,6 +1696,7 @@ function init() {
     if (state.token) {
       loadAccount({ silent: true });
       startAutoRefresh();
+      resetInactivityTimer();
     }
   });
 }

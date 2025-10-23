@@ -288,6 +288,30 @@ main {
   gap: 1.1rem;
 }
 
+.session-timer {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.3rem 0.75rem;
+  border-radius: 999px;
+  background: rgba(15, 23, 42, 0.06);
+  color: var(--color-muted);
+  font-size: 0.82rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.04em;
+}
+
+.session-timer::before {
+  content: "⏳";
+  font-size: 0.85rem;
+}
+
+.session-timer--warning {
+  background: rgba(220, 38, 38, 0.12);
+  color: var(--color-negative);
+}
+
 .user-pill {
   display: flex;
   align-items: center;
