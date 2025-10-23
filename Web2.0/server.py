@@ -634,6 +634,43 @@ def logout() -> Any:
         return _error(str(exc), 401)
 
 
+@app.put("/api/auth/password")
+def update_password() -> Any:
+    try:
+        username = _require_auth()
+    except PermissionError as exc:
+        return _error(str(exc), 401)
+
+    payload = request.get_json(force=True, silent=True) or {}
+    try:
+        current_password = _clean_password(payload.get("currentPassword"))
+        new_password = _clean_password(payload.get("newPassword"))
+    except ValueError as exc:
+        return _error(str(exc))
+
+    confirm_password = payload.get("confirmPassword")
+    if confirm_password is not None:
+        confirm_clean = str(confirm_password).strip()
+        if confirm_clean != new_password:
+            return _error("Neue Passwörter stimmen nicht überein")
+
+    user = store.get_user(username)
+    if not user:
+        return _error("Benutzer nicht gefunden", 404)
+
+    if not _verify_password(current_password, user):
+        return _error("Aktuelles Passwort ist falsch", 400)
+
+    credentials = _hash_password(new_password)
+    try:
+        store.set_user_field(username, "salt", credentials["salt"])
+        store.set_user_field(username, "password_hash", credentials["password_hash"])
+    except KeyError as exc:
+        return _error(str(exc), 404)
+
+    return jsonify({"success": True})
+
+
 @app.get("/api/accounts/me")
 def account_me() -> Any:
     try:
