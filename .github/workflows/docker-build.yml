@@ -59,7 +59,6 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: ./Dockerfile
+          file: ./Web2.0/Dockerfile
           push: true
           tags: ghcr.io/quentinrisy/bank-upstash-demo:latest
-
