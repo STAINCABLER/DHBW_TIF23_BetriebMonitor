@@ -40,7 +40,7 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: ./Dockerfile
+          file: ./Web2.0/Dockerfile
           push: true
           tags: ghcr.io/${{ env.owner_lc }}/bank-upstash-demo:latest
 
