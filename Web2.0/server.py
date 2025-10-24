@@ -1,10 +1,12 @@
 """Flask-Anwendung für das Web2.0-Banking-Demo."""
 
+import atexit
 import hashlib
 import json
 import os
 import re
 import secrets
+import threading
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Dict, List, Optional
@@ -23,6 +25,7 @@ load_dotenv()
 
 APP_SECRET = os.getenv("APP_SECRET_KEY", "dev-secret")
 SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", "3600"))
+SESSION_CLEANUP_INTERVAL_SECONDS = int(os.getenv("SESSION_CLEANUP_INTERVAL_SECONDS", "900"))
 
 _BALANCE_ADJUST_SCRIPT = """
 local key = KEYS[1]
@@ -282,6 +285,19 @@ class MemoryStore:
     def delete_session(self, token: str) -> None:
         self._sessions.pop(token, None)
 
+    def purge_stale_sessions(self) -> int:
+        now = datetime.now(timezone.utc)
+        removed = 0
+        for token, meta in list(self._sessions.items()):
+            expires = meta.get("expires")
+            username = meta.get("username")
+            is_expired = bool(expires and expires < now)
+            user_missing = username is not None and not self.user_exists(username)
+            if is_expired or user_missing:
+                self._sessions.pop(token, None)
+                removed += 1
+        return removed
+
 
 class UpstashStore:
     def __init__(self, client: "UpstashRedis") -> None:
@@ -400,6 +416,34 @@ class UpstashStore:
     def delete_session(self, token: str) -> None:
         self._client.delete(self._session_key(token))
 
+    def purge_stale_sessions(self) -> int:
+        removed = 0
+        try:
+            cursor = "0"
+            pattern = self._session_key("*")
+            while True:
+                scan_result = self._client.scan(cursor=cursor, match=pattern, count=48)
+                if isinstance(scan_result, (list, tuple)) and len(scan_result) == 2:
+                    cursor, keys = scan_result
+                else:  # pragma: no cover - defensive handling of client variants
+                    break
+                if not isinstance(keys, list):
+                    keys = []
+                for key in keys:
+                    token = key.split(":", 1)[1] if isinstance(key, str) and ":" in key else key
+                    username = self._client.get(key)
+                    ttl = self._client.ttl(key)
+                    user_missing = bool(username) and not self.user_exists(str(username))
+                    expired = isinstance(ttl, int) and ttl != -1 and ttl <= 0
+                    if not username or expired or user_missing:
+                        self._client.delete(key)
+                        removed += 1
+                if cursor in (0, "0", None):
+                    break
+        except Exception:  # pragma: no cover - Upstash scan may not be available
+            return removed
+        return removed
+
     @staticmethod
     def _user_key(username: str) -> str:
         return f"user:{username}"
@@ -450,6 +494,45 @@ store = _init_store()
 
 app = Flask(__name__, static_folder=".", static_url_path="")
 app.secret_key = APP_SECRET
+
+_session_cleanup_timer: Optional[threading.Timer] = None
+
+
+def _run_session_cleanup() -> None:
+    global _session_cleanup_timer
+    _session_cleanup_timer = None
+    purge = getattr(store, "purge_stale_sessions", None)
+    if callable(purge):
+        try:
+            removed = purge()
+            if removed:
+                print(f"Session-Bereinigung: {removed} Einträge entfernt.")
+        except Exception as exc:  # pragma: no cover - defensive logging
+            print(f"Session-Bereinigung fehlgeschlagen: {exc}")
+    _schedule_session_cleanup()
+
+
+def _schedule_session_cleanup() -> None:
+    global _session_cleanup_timer
+    if SESSION_CLEANUP_INTERVAL_SECONDS <= 0:
+        return
+    if _session_cleanup_timer is not None:
+        return
+    timer = threading.Timer(SESSION_CLEANUP_INTERVAL_SECONDS, _run_session_cleanup)
+    timer.daemon = True
+    _session_cleanup_timer = timer
+    timer.start()
+
+
+def _cancel_session_cleanup() -> None:
+    global _session_cleanup_timer
+    if _session_cleanup_timer is not None:
+        _session_cleanup_timer.cancel()
+        _session_cleanup_timer = None
+
+
+_schedule_session_cleanup()
+atexit.register(_cancel_session_cleanup)
 
 
 def _generate_account_id() -> str:
