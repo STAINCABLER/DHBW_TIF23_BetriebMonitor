@@ -38,7 +38,8 @@ jobs:
           context: .
           file: ./Dockerfile
           push: true
-          tags: ghcr.io/${{ github.repository_owner }}/bank-upstash-demo:latest
+          tags: ghcr.io/${{ github.repository_owner,, }}/bank-upstash-demo:latest
+
 
       # Step 5 — Verify image built successfully
       - name: Verify image
