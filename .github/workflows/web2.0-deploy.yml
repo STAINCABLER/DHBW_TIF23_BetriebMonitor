@@ -17,6 +17,9 @@ jobs:
   build-and-push:
     runs-on: ubuntu-latest
 
+    env:
+      IMAGE_NAME: dhbw_tif23_betriebmonitor
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -39,6 +42,15 @@ jobs:
       - name: Static analysis
         run: python -m compileall Web2.0/server.py
 
+      - name: Prepare image tags
+        id: prep
+        run: |
+          owner="${{ github.repository_owner }}"
+          owner_lower=$(printf '%s' "$owner" | tr '[:upper:]' '[:lower:]')
+          echo "owner=$owner_lower" >> "$GITHUB_OUTPUT"
+          echo "latest=$owner_lower/${IMAGE_NAME}:latest" >> "$GITHUB_OUTPUT"
+          echo "sha=$owner_lower/${IMAGE_NAME}:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -56,8 +68,8 @@ jobs:
           file: ./Web2.0/Dockerfile
           push: true
           tags: |
-            ghcr.io/${{ github.repository_owner }}/dhbw_tif23_betriebmonitor:latest
-            ghcr.io/${{ github.repository_owner }}/dhbw_tif23_betriebmonitor:${{ github.sha }}
+            ghcr.io/${{ steps.prep.outputs.latest }}
+            ghcr.io/${{ steps.prep.outputs.sha }}
           build-args: |
             BUILDKIT_INLINE_CACHE=1
 
