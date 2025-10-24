@@ -32,14 +32,17 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       # Step 4 — Build the Docker image
+      - name: Set lowercase owner
+        id: repo
+        run: echo "owner_lc=${GITHUB_REPOSITORY_OWNER,,}" >> $GITHUB_ENV
+
       - name: Build Docker image
         uses: docker/build-push-action@v5
         with:
           context: .
           file: ./Dockerfile
           push: true
-          tags: ghcr.io/${{ github.repository_owner,, }}/bank-upstash-demo:latest
-
+          tags: ghcr.io/${{ env.owner_lc }}/bank-upstash-demo:latest
 
       # Step 5 — Verify image built successfully
       - name: Verify image
