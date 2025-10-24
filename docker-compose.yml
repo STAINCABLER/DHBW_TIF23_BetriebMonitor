@@ -1,0 +1,12 @@
+---
+services:
+  web:
+    image: ghcr.io/staincabler/dhbw_tif23_betriebmonitor:latest
+    build:
+      context: ./Web2.0
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file:
+      - Web2.0/.env
+    ports:
+      - '80:8000'

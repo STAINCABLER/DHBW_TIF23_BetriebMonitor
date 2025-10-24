@@ -8,8 +8,10 @@ ENV PYTHONUNBUFFERED=1
 WORKDIR /app
 
 # ---- Abhängigkeiten ----
-COPY requirements.txt ./requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir \
+	Flask==3.0.3 \
+	python-dotenv==1.0.1 \
+	upstash-redis==1.5.0
 
 # ---- Anwendung kopieren ----
 COPY . /app
