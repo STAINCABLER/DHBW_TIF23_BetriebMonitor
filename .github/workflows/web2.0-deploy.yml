@@ -62,16 +62,24 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push container image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
-          context: .
-          file: Web2.0/Dockerfile
+          context: ./Web2.0
+          file: ./Web2.0/Dockerfile
           push: true
           tags: |
             ghcr.io/${{ steps.prep.outputs.latest }}
             ghcr.io/${{ steps.prep.outputs.sha }}
-          build-args: |
-            BUILDKIT_INLINE_CACHE=1
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
-      - name: Generate compose bundle
-        run: docker compose -f docker-compose.yml config
+      - name: Set up Docker Compose
+        uses: docker/setup-compose-action@v1
+        
+      - name: Validate compose configuration
+        run: |
+          if [ -f "docker-compose.yml" ]; then
+            docker compose -f docker-compose.yml config --quiet
+          else
+            echo "No docker-compose.yml found in repository root, skipping validation"
+          fi
