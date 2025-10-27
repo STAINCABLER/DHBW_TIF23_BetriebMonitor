@@ -69,6 +69,16 @@ Sämtliche geschützte Endpunkte erwarten den `Authorization: Bearer <token>` He
 - Ohne Upstash-Konfiguration nutzt der Server einen In-Memory-Store; ideal für lokale Tests, aber nicht persistent.
 - Für Debug-Ausgaben kann `FLASK_ENV=development` ergänzt werden.
 
+## Tests
+
+```powershell
+cd Web2.0
+pip install -r requirements.txt
+pytest tests
+```
+
+Die Suite fokussiert sich auf zentrale API-Flows (Registrierung, Login, Ein-/Auszahlungen, Überweisungen) und nutzt den `MemoryStore` für deterministische Ergebnisse.
+
 ## Lizenz
 
 Siehe [LICENSE](../LICENSE).

@@ -178,4 +178,6 @@ docker-compose.*.yml
 # /local.settings.json
 # /settings.json
 
+.github/copilot-instructions.md
+
 # Ende
