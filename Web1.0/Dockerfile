@@ -1,6 +1,9 @@
 # ---- Basis-Image ----
 FROM python:3.11-slim
 
+# ---- Metadaten ----
+LABEL org.opencontainers.image.description "DHBW TIF23 BetriebMonitor Web1.0"
+
 # ---- Arbeitsverzeichnis ----
 WORKDIR /app
 

@@ -1,6 +1,9 @@
 # ---- Basis-Image ----
 FROM python:3.11-slim
 
+# ---- Metadaten ----
+LABEL org.opencontainers.image.description "DHBW TIF23 BetriebMonitor Web2.0"
+
 # ---- Umgebungsvariablen ----
 ENV PYTHONUNBUFFERED=1
 
