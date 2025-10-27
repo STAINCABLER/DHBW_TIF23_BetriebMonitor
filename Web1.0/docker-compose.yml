@@ -1,0 +1,9 @@
+---
+services:
+  web:
+    image: ghcr.io/staincabler/dhbw_tif23_betriebmonitor-web1.0:latest
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - '80:8000'
