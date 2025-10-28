@@ -5,19 +5,16 @@ from crypto_utils import decrypt_private_key, sign_message_b64
 import server
 
 
-server.ADMIN_API_TOKEN = "test-admin-token"
+server.LEDGER_API_TOKEN = "test-ledger-token"
 
 
 def _auth_header(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
-def _admin_header() -> dict[str, str]:
-    return {"X-Admin-Token": server.ADMIN_API_TOKEN}
-
-
-def _dynamic_admin_header(token: str) -> dict[str, str]:
-    return {"X-Admin-Token": token}
+def _ledger_header(token: str | None = None) -> dict[str, str]:
+    value = token if token is not None else server.LEDGER_API_TOKEN
+    return {"X-Ledger-Token": value}
 
 
 def _register_user(client, *, email: str, first_name: str, last_name: str, initial: str = "0"):
@@ -389,7 +386,7 @@ def test_admin_transactions_list_filters_by_partner(client):
 
     list_response = client.get(
         "/api/transactions",
-        headers=_admin_header(),
+        headers=_ledger_header(),
         query_string={"limit": 5, "partner": register_response["publicKey"]},
     )
     assert list_response.status_code == 200
@@ -400,45 +397,7 @@ def test_admin_transactions_list_filters_by_partner(client):
         or entry["receiverPublicKey"] == register_response["publicKey"]
         for entry in entries
     )
-
-def test_creative_mode_login_yields_dynamic_admin_token(client, monkeypatch):
-    monkeypatch.setattr(server, "ADMIN_API_TOKEN", "", raising=False)
-    register_response, payload, account_id = _register_user(
-        client,
-        email="olga@example.com",
-        first_name="Olga",
-        last_name="Otto",
-    )
-
-    server.store.set_user_field(account_id, "mode", "creative")
-    server.store.set_user_field(account_id, "mode_seed", "unit-test-seed")
-    server.store.set_user_field(account_id, "mode_version", "1")
-
-    login_response = client.post(
-        "/api/auth/login",
-        json={"email": "olga@example.com", "password": payload["password"]},
-    )
-    assert login_response.status_code == 200
-    login_payload = login_response.get_json()
-    assert login_payload["adminMode"] == "creative"
-    assert login_payload["adminToken"]
-
-    admin_token = login_payload["adminToken"]
-    me_response = client.get(
-        "/api/accounts/me",
-        headers=_auth_header(login_payload["token"]),
-    )
-    assert me_response.status_code == 200
-    me_payload = me_response.get_json()
-    assert me_payload["adminToken"] == admin_token
-
-    list_response = client.get(
-        "/api/transactions",
-        headers=_dynamic_admin_header(admin_token),
-    )
-    assert list_response.status_code in (200, 204)
-
-def test_admin_transactions_inject_and_verify(client):
+def test_ledger_transactions_put_and_verify(client):
     register_response, payload, _ = _register_user(
         client,
         email="oliver@example.com",
@@ -446,7 +405,9 @@ def test_admin_transactions_inject_and_verify(client):
         last_name="Ort",
     )
 
-    private_key = _get_private_key(server.store.resolve_username_by_email("oliver@example.com"), payload["password"])
+    account_id = server.store.resolve_username_by_email("oliver@example.com")
+    assert account_id
+    private_key = _get_private_key(account_id, payload["password"])
     timestamp = server._now_iso()
     amount_str = "10.00"
     signature = _sign_transaction(
@@ -458,9 +419,10 @@ def test_admin_transactions_inject_and_verify(client):
         private_key=private_key,
     )
 
-    inject_response = client.post(
-        "/api/transactions",
-        headers=_admin_header(),
+    txn_id = "txn_manual_1"
+    upsert_response = client.put(
+        f"/api/transactions/{txn_id}",
+        headers=_ledger_header(),
         json={
             "type": "deposit",
             "amount": amount_str,
@@ -471,12 +433,13 @@ def test_admin_transactions_inject_and_verify(client):
             "metadata": {"source": "manual"},
         },
     )
-    assert inject_response.status_code == 201
-    txn_id = inject_response.get_json()["transactionId"]
+    assert upsert_response.status_code == 201
+    payload_body = upsert_response.get_json()
+    assert payload_body["transactionId"] == txn_id
 
     verify_response = client.get(
         f"/api/transactions/verify/{txn_id}",
-        headers=_admin_header(),
+        headers=_ledger_header(),
     )
     assert verify_response.status_code == 200
     verify_data = verify_response.get_json()
@@ -493,9 +456,10 @@ def test_admin_transaction_verify_reports_invalid_signature(client):
     )
 
     timestamp = server._now_iso()
-    inject_response = client.post(
-        "/api/transactions",
-        headers=_admin_header(),
+    txn_id = "txn_manual_invalid"
+    upsert_response = client.put(
+        f"/api/transactions/{txn_id}",
+        headers=_ledger_header(),
         json={
             "type": "deposit",
             "amount": "5.00",
@@ -506,12 +470,11 @@ def test_admin_transaction_verify_reports_invalid_signature(client):
             "skipSignatureCheck": True,
         },
     )
-    assert inject_response.status_code == 201
-    txn_id = inject_response.get_json()["transactionId"]
+    assert upsert_response.status_code == 201
 
     verify_response = client.get(
         f"/api/transactions/verify/{txn_id}",
-        headers=_admin_header(),
+        headers=_ledger_header(),
     )
     assert verify_response.status_code == 200
     verify_data = verify_response.get_json()
@@ -522,4 +485,105 @@ def test_admin_transaction_verify_reports_invalid_signature(client):
 def test_admin_transactions_require_token(client):
     response = client.get("/api/transactions")
     assert response.status_code == 401
-    assert response.get_json()["error"] == "Admin-Token fehlt"
+    assert response.get_json()["error"] == "Ledger-Token fehlt"
+
+
+def test_transactions_export_returns_all_entries(client):
+    register_response, payload, account_id = _register_user(
+        client,
+        email="quentin@example.com",
+        first_name="Quentin",
+        last_name="Quast",
+        initial="50",
+    )
+
+    private_key = _get_private_key(account_id, payload["password"])
+    timestamp = server._now_iso()
+    signature = _sign_transaction(
+        txn_type="deposit",
+        sender_public_key=register_response["publicKey"],
+        receiver_public_key=register_response["publicKey"],
+        amount="20.00",
+        timestamp=timestamp,
+        private_key=private_key,
+    )
+
+    client.put(
+        "/api/transactions/txn_export_1",
+        headers=_ledger_header(),
+        json={
+            "type": "deposit",
+            "amount": "20.00",
+            "timestamp": timestamp,
+            "senderPublicKey": register_response["publicKey"],
+            "receiverPublicKey": register_response["publicKey"],
+            "signature": signature,
+        },
+    )
+
+    export_response = client.get(
+        "/api/transactions/export",
+        headers=_ledger_header(),
+    )
+    assert export_response.status_code == 200
+    transactions = export_response.get_json()["transactions"]
+    ids = {entry["transactionId"] for entry in transactions}
+    assert "txn_export_1" in ids
+
+
+def test_ledger_instances_register_list_and_heartbeat(client):
+    headers = _ledger_header()
+    register_response = client.post(
+        "/api/ledger/instances",
+        headers=headers,
+        json={
+            "instanceId": "bank-a",
+            "baseUrl": "https://bank-a.example",
+            "publicKey": "PUBKEY",
+            "metadata": {"region": "EU"},
+        },
+    )
+    assert register_response.status_code == 201
+    stored = register_response.get_json()
+    assert stored["instanceId"] == "bank-a"
+    assert stored["metadata"]["region"] == "EU"
+
+    list_response = client.get("/api/ledger/instances", headers=headers)
+    assert list_response.status_code == 200
+    instances = list_response.get_json()["instances"]
+    assert any(item["instanceId"] == "bank-a" for item in instances)
+
+    heartbeat_response = client.post(
+        "/api/ledger/instances/bank-a/heartbeat",
+        headers=headers,
+        json={"status": "online"},
+    )
+    assert heartbeat_response.status_code == 200
+    heartbeat_payload = heartbeat_response.get_json()
+    assert heartbeat_payload["status"] == "online"
+
+    delete_response = client.delete("/api/ledger/instances/bank-a", headers=headers)
+    assert delete_response.status_code == 200
+    assert delete_response.get_json()["success"] is True
+
+
+def test_ledger_instances_put_creates_and_updates(client):
+    headers = _ledger_header()
+    create_response = client.put(
+        "/api/ledger/instances/bank-b",
+        headers=headers,
+        json={"baseUrl": "bank-b.example", "status": "init"},
+    )
+    assert create_response.status_code == 201
+    created_payload = create_response.get_json()
+    assert created_payload["baseUrl"] == "https://bank-b.example"
+
+    update_response = client.put(
+        "/api/ledger/instances/bank-b",
+        headers=headers,
+        json={"metadata": {"clusters": 2}, "status": "active"},
+    )
+    assert update_response.status_code == 200
+    updated_payload = update_response.get_json()
+    assert updated_payload["metadata"]["clusters"] == 2
+    assert updated_payload["status"] == "active"

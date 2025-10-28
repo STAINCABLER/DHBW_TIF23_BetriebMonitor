@@ -50,17 +50,90 @@ Listet Ledger-Einträge paginiert auf. Optional können Ergebnisse auf eine Gege
 | 401 | `X-Ledger-Token` fehlt oder stimmt nicht mit `LEDGER_API_TOKEN` überein. |
 | 503 | Ledger-API ist deaktiviert (kein `LEDGER_API_TOKEN` gesetzt). |
 
-## POST `/api/transactions`
+## GET `/api/transactions/export`
 
-Dieser Endpunkt ist derzeit read-only deaktiviert. Der Server beantwortet jeden Aufruf mit HTTP 405 und dem Hinweis `"Ledger kann nur gelesen werden"`.
+Gibt das vollständige Ledger als Liste zurück. Interne Paginierung wird serverseitig abgehandelt; Client-Anfragen benötigen keine zusätzlichen Parameter.
 
-### Fehlerantworten (Ledger Injection)
+### Response 200 (Ledger Export)
+
+```json
+{
+  "transactions": [
+    {
+      "transactionId": "txn_...",
+      "type": "deposit",
+      "amount": "150.00",
+      "senderPublicKey": "B64==",
+      "receiverPublicKey": "B64==",
+      "signature": "B64==",
+      "timestamp": "2024-05-04T12:00:00+00:00"
+    }
+  ]
+}
+```
+
+### Fehlerantworten (Ledger Export)
 
 | Status | Grund |
 | --- | --- |
 | 401 | `X-Ledger-Token` fehlt oder ist ungültig. |
-| 405 | Ledger-Schreiboperationen sind deaktiviert. |
-| 503 | Ledger-API ist deaktiviert (kein `LEDGER_API_TOKEN` gesetzt). |
+| 503 | Ledger-API ist deaktiviert. |
+
+## PUT `/api/transactions/{transactionId}`
+
+Legt einen Ledger-Eintrag mit der angegebenen ID an oder aktualisiert ihn. Bei bestehenden Einträgen muss `allowUpdate = true` gesetzt werden, sonst antwortet der Server mit `409 Konflikt`.
+
+### Request-JSON (Ledger Upsert)
+
+```json
+{
+  "type": "deposit",
+  "amount": "150.00",
+  "timestamp": "2024-05-04T12:00:00+00:00",
+  "senderPublicKey": "B64==",
+  "receiverPublicKey": "B64==",
+  "signature": "B64==",
+  "metadata": {
+    "source": "manual"
+  },
+  "allowUpdate": false,
+  "skipSignatureCheck": false
+}
+```
+
+### Response 201/200 (Ledger Upsert)
+
+```json
+{
+  "transactionId": "txn_123",
+  "ledgerEntry": {
+    "transactionId": "txn_123",
+    "type": "deposit",
+    "amount": "150.00",
+    "senderPublicKey": "B64==",
+    "receiverPublicKey": "B64==",
+    "signature": "B64==",
+    "timestamp": "2024-05-04T12:00:00+00:00",
+    "metadata": {
+      "source": "manual"
+    }
+  }
+}
+```
+
+- Status `201` signalisiert einen neuen Eintrag, `200` eine erfolgreiche Aktualisierung.
+- `skipSignatureCheck` sollte nur für Testfälle genutzt werden; ohne diese Option wird die Signatur verifiziert.
+
+### Fehlerantworten (Ledger Upsert)
+
+| Status | Grund |
+| --- | --- |
+| 400 | Ungültige Eingaben oder Signatur fehlgeschlagen. |
+| 401 | `X-Ledger-Token` fehlt oder ist ungültig. |
+| 409 | Transaktion existiert bereits und `allowUpdate` ist `false`. |
+| 503 | Ledger-API ist deaktiviert. |
+
+> **Hinweis:** POST-Anfragen auf `/api/transactions` werden mit HTTP 405 beantwortet (`"Ledger-Schreiboperationen nutzen PUT /api/transactions/{transactionId}"`).
 
 ## GET `/api/transactions/verify/{transactionId}`
 
@@ -98,5 +171,5 @@ Bei ungültiger Signatur enthält die Antwort zusätzlich `"reason": "Signatur u
 
 - **Token-Handling:** Bewahre das konfigurierte `LEDGER_API_TOKEN` geheim. Ist kein Token hinterlegt, antworten die Endpunkte mit 503 und sind faktisch deaktiviert.
 - **Signaturvalidierung:** Für verlässliche Ergebnisse sollten Tests `skipSignatureCheck = false` setzen. Nur für Negativtests darf die Prüfung übersprungen werden.
-- **Ledger-Auswirkungen:** POST-Aufrufe ändern ausschließlich das Ledger. Kontostände oder Nutzertransaktionen werden dadurch nicht automatisiert angepasst.
+- **Ledger-Auswirkungen:** Ledger-Upserts erfassen nur Transaktionen im globalen Journal. Konto- oder Nutzerstände werden dadurch nicht automatisch angepasst.
 - **Paginierung:** Nutze `nextSinceId`, um Folgeseiten abzurufen (`?sinceId=<value>`).

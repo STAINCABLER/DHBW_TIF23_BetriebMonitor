@@ -101,6 +101,17 @@ def _ledger_headers(token: str) -> Dict[str, str]:
     return {"X-Ledger-Token": token} if token else {}
 
 
+def _normalize_base_url(raw: Any) -> str:
+    if not isinstance(raw, str):
+        raise ValueError("Ungültige URL")
+    candidate = raw.strip()
+    if not candidate:
+        raise ValueError("URL darf nicht leer sein")
+    if not candidate.startswith(("https://", "http://")):
+        candidate = f"https://{candidate}"
+    return candidate.rstrip("/")
+
+
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 NAME_RE = re.compile(r"^[A-Za-zÀ-ÖØ-öø-ÿ' -]{2,50}$")
 GERMAN_IBAN_RE = re.compile(r"^DE\d{20}$")
@@ -266,6 +277,35 @@ _KEYPAIR_ROTATE_SCHEMA = _KeypairRotateSchema()
 _KEYPAIR_DELETE_SCHEMA = _KeypairDeleteSchema()
 _TRANSACTIONS_QUERY_SCHEMA = _TransactionsQuerySchema()
 _TRANSACTIONS_INJECTION_SCHEMA = _TransactionsInjectionSchema()
+
+
+class _LedgerInstanceRegisterSchema(Schema):
+    instance_id = fields.String(required=True, data_key="instanceId", validate=validate.Length(min=3, max=120))
+    base_url = fields.String(required=True, data_key="baseUrl")
+    public_key = fields.String(load_default=None, data_key="publicKey")
+    token = fields.String(load_default=None)
+    metadata = fields.Dict(keys=fields.String(), values=fields.Raw(), load_default=None)
+    status = fields.String(load_default=None)
+    last_seen = fields.String(load_default=None, data_key="lastSeen")
+
+
+class _LedgerInstanceUpdateSchema(Schema):
+    base_url = fields.String(load_default=None, data_key="baseUrl")
+    public_key = fields.String(load_default=None, data_key="publicKey")
+    token = fields.String(load_default=None)
+    metadata = fields.Dict(keys=fields.String(), values=fields.Raw(), load_default=None)
+    status = fields.String(load_default=None)
+    last_seen = fields.String(load_default=None, data_key="lastSeen")
+
+
+class _LedgerHeartbeatSchema(Schema):
+    status = fields.String(load_default=None)
+    metadata = fields.Dict(keys=fields.String(), values=fields.Raw(), load_default=None)
+
+
+_LEDGER_INSTANCE_REGISTER_SCHEMA = _LedgerInstanceRegisterSchema()
+_LEDGER_INSTANCE_UPDATE_SCHEMA = _LedgerInstanceUpdateSchema()
+_LEDGER_HEARTBEAT_SCHEMA = _LedgerHeartbeatSchema()
 
 
 class MemoryStore:
@@ -1002,10 +1042,6 @@ def _cancel_session_cleanup() -> None:
 _schedule_session_cleanup()
 atexit.register(_cancel_session_cleanup)
 
-_start_ledger_sync()
-atexit.register(_stop_ledger_sync)
-
-
 def _generate_account_id() -> str:
     while True:
         candidate = f"acct_{secrets.token_hex(4)}"
@@ -1265,6 +1301,10 @@ def _stop_ledger_sync() -> None:
     _ledger_sync_thread = None
 
 
+_start_ledger_sync()
+atexit.register(_stop_ledger_sync)
+
+
 def _issue_session(username: str) -> str:
     token = secrets.token_urlsafe(32)
     store.save_session(token, username, SESSION_TTL_SECONDS)
@@ -1505,6 +1545,204 @@ def ledger_nodes() -> Any:
             entry["token"] = token
         nodes_payload.append(entry)
     return jsonify({"nodes": nodes_payload})
+
+
+def _ledger_instances_store_available() -> bool:
+    return all(
+        callable(getattr(store, attr, None))
+        for attr in ("list_bank_instances", "register_bank_instance", "upsert_bank_instance", "delete_bank_instance")
+    )
+
+
+@app.get("/api/ledger/instances")
+def ledger_instances_list() -> Any:
+    try:
+        _require_ledger_token()
+    except PermissionError as exc:
+        return _ledger_error_response(exc)
+
+    if not _ledger_instances_store_available():  # pragma: no cover - defensive guard
+        return jsonify({"instances": []})
+
+    instances = store.list_bank_instances()
+    return jsonify({"instances": instances})
+
+
+@app.post("/api/ledger/instances")
+def ledger_instances_register() -> Any:
+    try:
+        _require_ledger_token()
+    except PermissionError as exc:
+        return _ledger_error_response(exc)
+
+    if not _ledger_instances_store_available():  # pragma: no cover - defensive guard
+        return _error("Bankinstanzen können derzeit nicht verwaltet werden", 503)
+
+    payload = request.get_json(force=True, silent=True) or {}
+    try:
+        data = _LEDGER_INSTANCE_REGISTER_SCHEMA.load(payload)
+    except ValidationError as exc:
+        return _error(_validation_error_message(exc))
+
+    instance_id = data["instance_id"].strip()
+    try:
+        base_url = _normalize_base_url(data["base_url"])
+    except ValueError as exc:
+        return _error(str(exc))
+
+    record: Dict[str, Any] = {
+        "baseUrl": base_url,
+        "lastSeen": data.get("last_seen") or _now_iso(),
+    }
+    if data.get("public_key") is not None:
+        record["publicKey"] = data["public_key"]
+    token_value = (data.get("token") or "").strip()
+    if token_value:
+        record["token"] = token_value
+    if data.get("metadata") is not None:
+        record["metadata"] = data["metadata"]
+    if data.get("status") is not None:
+        record["status"] = data["status"]
+
+    try:
+        store.register_bank_instance(instance_id, record)
+    except ValueError as exc:
+        message = str(exc)
+        status = 409 if "existiert" in message.lower() else 400
+        return _error(message, status)
+
+    stored = store.get_bank_instance(instance_id)
+    return jsonify(stored), 201
+
+
+@app.get("/api/ledger/instances/<string:instance_id>")
+def ledger_instances_get(instance_id: str) -> Any:
+    try:
+        _require_ledger_token()
+    except PermissionError as exc:
+        return _ledger_error_response(exc)
+
+    getter = getattr(store, "get_bank_instance", None)
+    if not callable(getter):  # pragma: no cover - defensive guard
+        return _error("Bankinstanzen können derzeit nicht verwaltet werden", 503)
+
+    record = getter(instance_id)
+    if not record:
+        return _error("Instanz nicht gefunden", 404)
+    return jsonify(record)
+
+
+def _apply_instance_update(instance_id: str, update: Dict[str, Any], *, require_existing: bool = False) -> Dict[str, Any]:
+    getter = getattr(store, "get_bank_instance", None)
+    if not callable(getter):  # pragma: no cover - defensive guard
+        raise RuntimeError("Bankinstanzen können derzeit nicht verwaltet werden")
+
+    existing = getter(instance_id)
+    if require_existing and not existing:
+        raise LookupError("Instanz nicht gefunden")
+
+    record = existing.copy() if existing else {}
+
+    if "base_url" in update and update["base_url"] is not None:
+        record["baseUrl"] = _normalize_base_url(update["base_url"])
+    if "public_key" in update and update["public_key"] is not None:
+        record["publicKey"] = update["public_key"]
+    if "token" in update:
+        token_value = (update.get("token") or "").strip()
+        if token_value:
+            record["token"] = token_value
+        else:
+            record.pop("token", None)
+    if "metadata" in update and update["metadata"] is not None:
+        record["metadata"] = update["metadata"]
+    if "status" in update and update["status"] is not None:
+        record["status"] = update["status"]
+    if "last_seen" in update and update["last_seen"] is not None:
+        record["lastSeen"] = update["last_seen"]
+    else:
+        record["lastSeen"] = _now_iso()
+
+    store.upsert_bank_instance(instance_id, record)
+    updated = getter(instance_id)
+    if not updated:  # pragma: no cover - defensive guard
+        raise LookupError("Instanz nicht gefunden")
+    return updated
+
+
+@app.put("/api/ledger/instances/<string:instance_id>")
+def ledger_instances_update(instance_id: str) -> Any:
+    try:
+        _require_ledger_token()
+    except PermissionError as exc:
+        return _ledger_error_response(exc)
+
+    if not _ledger_instances_store_available():  # pragma: no cover - defensive guard
+        return _error("Bankinstanzen können derzeit nicht verwaltet werden", 503)
+
+    payload = request.get_json(force=True, silent=True) or {}
+    try:
+        data = _LEDGER_INSTANCE_UPDATE_SCHEMA.load(payload)
+    except ValidationError as exc:
+        return _error(_validation_error_message(exc))
+
+    existing = store.get_bank_instance(instance_id) if callable(getattr(store, "get_bank_instance", None)) else None
+    if existing is None and data.get("base_url") in (None, ""):
+        return _error("baseUrl wird für neue Instanzen benötigt")
+    try:
+        updated = _apply_instance_update(instance_id, data)
+    except LookupError:
+        return _error("Instanz nicht gefunden", 404)
+    except ValueError as exc:
+        return _error(str(exc))
+
+    status_code = 200 if existing else 201
+    return jsonify(updated), status_code
+
+
+@app.post("/api/ledger/instances/<string:instance_id>/heartbeat")
+def ledger_instances_heartbeat(instance_id: str) -> Any:
+    try:
+        _require_ledger_token()
+    except PermissionError as exc:
+        return _ledger_error_response(exc)
+
+    if not _ledger_instances_store_available():  # pragma: no cover - defensive guard
+        return _error("Bankinstanzen können derzeit nicht verwaltet werden", 503)
+
+    payload = request.get_json(force=True, silent=True) or {}
+    try:
+        data = _LEDGER_HEARTBEAT_SCHEMA.load(payload)
+    except ValidationError as exc:
+        return _error(_validation_error_message(exc))
+
+    try:
+        update_payload = {
+            "status": data.get("status"),
+            "metadata": data.get("metadata"),
+            "last_seen": _now_iso(),
+        }
+        updated = _apply_instance_update(instance_id, update_payload, require_existing=True)
+    except LookupError:
+        return _error("Instanz nicht gefunden", 404)
+    except ValueError as exc:
+        return _error(str(exc))
+
+    return jsonify(updated)
+
+
+@app.delete("/api/ledger/instances/<string:instance_id>")
+def ledger_instances_delete(instance_id: str) -> Any:
+    try:
+        _require_ledger_token()
+    except PermissionError as exc:
+        return _ledger_error_response(exc)
+
+    deleter = getattr(store, "delete_bank_instance", None)
+    if not callable(deleter):  # pragma: no cover - defensive guard
+        return _error("Bankinstanzen können derzeit nicht verwaltet werden", 503)
+
+    deleter(instance_id)
+    return jsonify({"success": True})
 
 
 @app.post("/api/auth/register")
@@ -2266,6 +2504,31 @@ def transactions_admin_list() -> Any:
     return jsonify(body)
 
 
+def _collect_all_ledger_transactions(batch_size: int = 200) -> List[Dict[str, Any]]:
+    collected: List[Dict[str, Any]] = []
+    cursor: Optional[str] = None
+    while True:
+        batch = store.list_ledger_transactions(after_transaction_id=cursor, limit=batch_size)
+        if not batch:
+            break
+        collected.extend(batch)
+        cursor = batch[-1].get("transactionId")
+        if len(batch) < batch_size or not cursor:
+            break
+    return collected
+
+
+@app.get("/api/transactions/export")
+def transactions_admin_export() -> Any:
+    try:
+        _require_ledger_token()
+    except PermissionError as exc:
+        return _ledger_error_response(exc)
+
+    transactions = _collect_all_ledger_transactions()
+    return jsonify({"transactions": transactions})
+
+
 @app.post("/api/transactions")
 def transactions_admin_inject() -> Any:
     try:
@@ -2273,7 +2536,69 @@ def transactions_admin_inject() -> Any:
     except PermissionError as exc:
         return _ledger_error_response(exc)
 
-    return _error("Ledger kann nur gelesen werden", 405)
+    return _error("Ledger-Schreiboperationen nutzen PUT /api/transactions/<transactionId>", 405)
+
+
+@app.put("/api/transactions/<string:transaction_id>")
+def transactions_admin_upsert(transaction_id: str) -> Any:
+    try:
+        _require_ledger_token()
+    except PermissionError as exc:
+        return _ledger_error_response(exc)
+
+    payload = request.get_json(force=True, silent=True) or {}
+    try:
+        data = _TRANSACTIONS_INJECTION_SCHEMA.load(payload)
+    except ValidationError as exc:
+        return _error(_validation_error_message(exc))
+
+    body_transaction_id = data.get("transaction_id")
+    if body_transaction_id and body_transaction_id != transaction_id:
+        return _error("transactionId widerspricht der URL", 400)
+
+    amount = Decimal(str(data["amount"]))
+    amount_str = _format_amount(amount.copy_abs())
+    timestamp = str(data["timestamp"])  # noqa: F841  # value reused in message
+    signature = data["signature"]
+
+    if not data.get("skip_signature_check"):
+        if not _verify_transaction_signature(
+            str(data["type"]),
+            str(data["sender_public_key"]),
+            str(data["receiver_public_key"]),
+            amount_str,
+            timestamp,
+            signature,
+        ):
+            return _error("Signatur ungültig", 400)
+
+    ledger_entry: Dict[str, Any] = {
+        "transactionId": transaction_id,
+        "type": data["type"],
+        "amount": amount_str,
+        "senderPublicKey": data["sender_public_key"],
+        "receiverPublicKey": data["receiver_public_key"],
+        "signature": signature,
+        "timestamp": timestamp,
+    }
+    if data.get("metadata") is not None:
+        ledger_entry["metadata"] = data["metadata"]
+
+    existing = store.get_ledger_transaction(transaction_id)
+    if existing and not data.get("allow_update"):
+        return _error("Transaktion existiert bereits", 409)
+
+    try:
+        if existing:
+            store.upsert_ledger_transaction(ledger_entry)
+            status_code = 200
+        else:
+            store.append_ledger_transaction(ledger_entry)
+            status_code = 201
+    except ValueError as exc:
+        return _error(str(exc), 400)
+
+    return jsonify({"transactionId": transaction_id, "ledgerEntry": ledger_entry}), status_code
 
 
 @app.get("/api/transactions/verify/<string:transaction_id>")
