@@ -2,7 +2,7 @@
 FROM python:3.11-slim
 
 # ---- Metadaten ----
-LABEL org.opencontainers.image.description "DHBW TIF23 BetriebMonitor Web3.0"
+LABEL org.opencontainers.image.description="DHBW TIF23 BetriebMonitor Web3.0"
 
 # ---- Umgebungsvariablen ----
 ENV PYTHONUNBUFFERED=1
@@ -11,10 +11,9 @@ ENV PYTHONUNBUFFERED=1
 WORKDIR /app
 
 # ---- Abhängigkeiten ----
+# hadolint ignore=DL3008
 RUN apt-get update \
-	&& apt-get install -y --no-install-recommends \
-		build-essential=12.9ubuntu3 \
-		libffi-dev=3.4.2-4 \
+	&& apt-get install -y --no-install-recommends build-essential libffi-dev \
 	&& rm -rf /var/lib/apt/lists/*
 
 # ---- Python-Abhängigkeiten ----
