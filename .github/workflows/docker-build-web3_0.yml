@@ -16,7 +16,6 @@ permissions:
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
-
     env:
       IMAGE_NAME: dhbw_tif23_betriebmonitor-web3.0
 
@@ -28,6 +27,7 @@ jobs:
         uses: hadolint/hadolint-action@v3.1.0
         with:
           dockerfile: Web3.0/Dockerfile
+          failure-threshold: error
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -75,7 +75,7 @@ jobs:
 
       - name: Set up Docker Compose
         uses: docker/setup-compose-action@v1
-        
+
       - name: Validate compose configuration
         run: |
           if [ -f "docker-compose.yml" ]; then

@@ -11,11 +11,10 @@ ENV PYTHONUNBUFFERED=1
 WORKDIR /app
 
 # ---- Abhängigkeiten ----
-# Install system dependencies required for cryptography build (if any)
-# hadolint ignore=DL3008
-# Keeping packages unpinned ensures regular security fixes via base image updates
 RUN apt-get update \
-	&& apt-get install -y --no-install-recommends build-essential libffi-dev \
+	&& apt-get install -y --no-install-recommends \
+		build-essential=12.9ubuntu3 \
+		libffi-dev=3.4.2-4 \
 	&& rm -rf /var/lib/apt/lists/*
 
 # ---- Python-Abhängigkeiten ----
