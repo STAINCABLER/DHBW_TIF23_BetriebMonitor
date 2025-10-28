@@ -1,0 +1,69 @@
+name: Test Frontend Web3.0
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/test-frontend-web3_0.yml
+      - Web3.0/assets/**
+      - Web3.0/css/**
+      - Web3.0/index.html
+      - Web3.0/login.html
+      - Web3.0/package.json
+      - Web3.0/tests/**
+      - Web3.0/requirements.txt
+  pull_request:
+    paths:
+      - .github/workflows/test-frontend-web3_0.yml
+      - Web3.0/assets/**
+      - Web3.0/css/**
+      - Web3.0/index.html
+      - Web3.0/login.html
+      - Web3.0/package.json
+      - Web3.0/tests/**
+      - Web3.0/requirements.txt
+
+jobs:
+  lint-and-test:
+    name: Run frontend checks
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: Web3.0
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: Web3.0/package-lock.json
+
+      - name: Install frontend dependencies
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+
+      - name: Run frontend lint
+        run: npm test
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: Web3.0/requirements.txt
+
+      - name: Install backend dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run shared pytest suite
+        run: pytest tests --maxfail=1 --disable-warnings -q

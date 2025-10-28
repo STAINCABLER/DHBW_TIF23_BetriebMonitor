@@ -1,0 +1,2152 @@
+const state = {
+  token: window.localStorage.getItem('altebank_session') || null,
+  account: null,
+  transactions: [],
+  keyMaterial: null,
+  privateKey: null,
+  keyPassphrase: null,
+  bankPublicKey: 'BANK_SYSTEM',
+  filters: {
+    type: '',
+    from: '',
+    to: '',
+    min: '',
+    max: '',
+  },
+  activeSection: 'overview',
+  historyRange: '30',
+  sectionNeedsUpdate: {
+    overview: false,
+    history: false,
+  },
+  signingAvailable: Boolean(window.AlteBankCrypto),
+};
+
+const KEY_STORAGE_KEY = 'altebank_private_key_b64';
+const ENCRYPTED_KEY_STORAGE_KEY = 'altebank_encrypted_key_json';
+const DEBUG = Boolean(window.ALTEBANK_DEBUG);
+
+const qs = (selector, scope = document) => scope.querySelector(selector);
+const qa = (selector, scope = document) => Array.from(scope.querySelectorAll(selector));
+
+function getFormValues(form) {
+  return Object.fromEntries(
+    Array.from(new FormData(form).entries()).map(([key, value]) => [key, typeof value === 'string' ? value.trim() : value]),
+  );
+}
+
+function persistEncryptedKey(payload) {
+  if (!window.sessionStorage) {
+    return;
+  }
+  try {
+    if (!payload) {
+      window.sessionStorage.removeItem(ENCRYPTED_KEY_STORAGE_KEY);
+      return;
+    }
+    window.sessionStorage.setItem(ENCRYPTED_KEY_STORAGE_KEY, JSON.stringify(payload));
+  } catch (error) {
+    console.warn('Konnte verschlüsselten Schlüssel nicht speichern:', error);
+  }
+}
+
+function storePrivateKeyBytes(bytes) {
+  if (!bytes) {
+    return;
+  }
+  state.privateKey = bytes;
+  if (!window.sessionStorage || !state.signingAvailable) {
+    return;
+  }
+  try {
+    const encoded = window.AlteBankCrypto.bytesToBase64(bytes);
+    window.sessionStorage.setItem(KEY_STORAGE_KEY, encoded);
+  } catch (error) {
+    console.warn('Konnte privaten Schlüssel nicht speichern:', error);
+  }
+}
+
+function loadPrivateKeyFromStorage() {
+  if (!window.sessionStorage || !state.signingAvailable) {
+    return null;
+  }
+  const stored = window.sessionStorage.getItem(KEY_STORAGE_KEY);
+  if (!stored) {
+    return null;
+  }
+  try {
+    const bytes = window.AlteBankCrypto.base64ToBytes(stored);
+    state.privateKey = bytes;
+    return bytes;
+  } catch (error) {
+    console.warn('Privater Schlüssel aus dem Speicher konnte nicht gelesen werden:', error);
+    window.sessionStorage.removeItem(KEY_STORAGE_KEY);
+  }
+  return null;
+}
+
+function setKeyMaterial(material, options = {}) {
+  if (!material) {
+    state.keyMaterial = null;
+    state.privateKey = null;
+    state.keyPassphrase = null;
+    persistEncryptedKey(null);
+    if (window.sessionStorage) {
+      window.sessionStorage.removeItem(KEY_STORAGE_KEY);
+    }
+    return;
+  }
+  const merged = {
+    publicKey: material.publicKey || state.keyMaterial?.publicKey || null,
+    encryptedPrivateKey: material.encryptedPrivateKey || state.keyMaterial?.encryptedPrivateKey || null,
+    keyCreatedAt: material.keyCreatedAt || material.createdAt || state.keyMaterial?.keyCreatedAt || null,
+  };
+  state.keyMaterial = merged;
+  if (material.bankPublicKey) {
+    state.bankPublicKey = material.bankPublicKey || 'BANK_SYSTEM';
+  }
+  if (merged.encryptedPrivateKey) {
+    persistEncryptedKey(merged.encryptedPrivateKey);
+  }
+  if (options.password && merged.encryptedPrivateKey && state.signingAvailable) {
+    unlockPrivateKeyWithPassword(options.password).catch((error) => {
+      console.warn('Privater Schlüssel konnte nicht automatisch entsperrt werden:', error);
+    });
+  }
+}
+
+async function unlockPrivateKeyWithPassword(password) {
+  if (!state.signingAvailable) {
+    throw new Error('Signaturfunktion steht nicht zur Verfügung.');
+  }
+  if (!state.keyMaterial?.encryptedPrivateKey) {
+    throw new Error('Kein verschlüsselter Schlüssel gefunden.');
+  }
+  await ensureArgon2Available();
+  const bytes = await window.AlteBankCrypto.decryptPrivateKey(state.keyMaterial.encryptedPrivateKey, password);
+  storePrivateKeyBytes(bytes);
+  state.keyPassphrase = password;
+  return bytes;
+}
+
+async function ensurePrivateKeyUnlocked(options = {}) {
+  if (!state.signingAvailable) {
+    throw new Error('Digitale Signatur wird nicht unterstützt.');
+  }
+  if (state.privateKey instanceof Uint8Array) {
+    return state.privateKey;
+  }
+  const restored = loadPrivateKeyFromStorage();
+  if (restored) {
+    return restored;
+  }
+  if (state.keyPassphrase) {
+    try {
+      return await unlockPrivateKeyWithPassword(state.keyPassphrase);
+    } catch (error) {
+      console.warn('Gespeichertes Passwort konnte Schlüssel nicht entsperren:', error);
+    }
+  }
+  if (options.prompt === false) {
+    throw new Error('Privater Schlüssel nicht entsperrt.');
+  }
+  try {
+    return await requestKeyUnlock();
+  } catch (error) {
+    if (error instanceof Error) {
+      throw error;
+    }
+    throw new Error('Signatur abgebrochen.');
+  }
+}
+
+function normalizeAmountInput(rawValue) {
+  if (rawValue === undefined || rawValue === null) {
+    throw new Error('Betrag fehlt.');
+  }
+  const sanitized = String(rawValue).replace(',', '.');
+  const amount = Number(sanitized);
+  if (!Number.isFinite(amount) || amount <= 0) {
+    throw new Error('Ungültiger Betrag.');
+  }
+  return amount.toFixed(2);
+}
+
+async function resolveReceiverPublicKey(type, payload) {
+  if (type === 'deposit') {
+    return state.keyMaterial?.publicKey || state.account?.publicKey || null;
+  }
+  if (type === 'withdraw') {
+    return state.bankPublicKey || state.account?.bankPublicKey || 'BANK_SYSTEM';
+  }
+  if (type === 'transfer') {
+    const iban = sanitizeIban(payload.targetIban);
+    if (!iban) {
+      throw new Error('IBAN fehlt.');
+    }
+    payload.targetIban = iban;
+    const result = await apiFetch('/api/accounts/resolve', {
+      method: 'POST',
+      body: { targetIban: iban },
+    });
+    if (!result?.publicKey) {
+      throw new Error('Empfänger-Schlüssel nicht gefunden.');
+    }
+    return result.publicKey;
+  }
+  throw new Error('Unbekannter Transaktionstyp.');
+}
+
+async function signTransactionPayload(type, payload) {
+  const senderPublicKey = state.keyMaterial?.publicKey || state.account?.publicKey;
+  if (!senderPublicKey) {
+    throw new Error('Kein öffentlicher Schlüssel geladen.');
+  }
+  const amountFixed = normalizeAmountInput(payload.amount);
+  const privateKey = await ensurePrivateKeyUnlocked();
+  const receiverPublicKey = await resolveReceiverPublicKey(type, payload);
+  if (!receiverPublicKey) {
+    throw new Error('Empfänger-Schlüssel konnte nicht ermittelt werden.');
+  }
+  const timestamp = new Date().toISOString();
+  const messageType = type === 'transfer' ? 'transfer' : type;
+  const canonicalPayload = {
+    amount: amountFixed,
+    receiver: receiverPublicKey,
+    sender: senderPublicKey,
+    timestamp,
+    type: messageType,
+  };
+  const { signature } = window.AlteBankCrypto.signDetached(privateKey, canonicalPayload);
+  return { signature, timestamp, amount: amountFixed };
+}
+
+const elements = {
+  brand: qs('.brand'),
+  brandLogoWrapper: qs('.brand__logo-wrapper'),
+  brandTextBlock: qs('.brand__text'),
+  topNav: qs('.top-nav'),
+  guestNav: qs('#guestNav'),
+  userNav: qs('#userNav'),
+  navSectionButtons: qa('[data-nav-section]'),
+  dashboardSections: qa('.dashboard-section'),
+  heroBalance: qs('#heroBalance'),
+  balanceValue: qs('#balanceValue'),
+  dashboard: qs('#dashboard'),
+  landing: qs('.landing'),
+  guestActions: qs('#guestActions'),
+  userActions: qs('#userActions'),
+  sessionTimer: qs('#sessionTimer'),
+  userInitial: qs('#userInitial'),
+  currentUser: qs('#currentUser'),
+  openAccountSettingsBtn: qs('[data-open-account-settings]'),
+  accountSettingsModal: qs('#accountSettingsModal'),
+  accountSettingsFeedback: qs('#accountSettingsFeedback'),
+  profileForm: qs('#profileForm'),
+  passwordForm: qs('#passwordForm'),
+  accountDeleteForm: qs('#accountDeleteForm'),
+  accountDeleteIbanInput: qs('#accountDeleteIban'),
+  accountDeleteIbanHint: qs('#accountDeleteIbanHint'),
+  settingsTabButtons: qa('[data-settings-tab]'),
+  settingsPanels: qa('[data-settings-panel]'),
+  accountHolder: qs('#accountHolder'),
+  accountIban: qs('#accountIban'),
+  accountEmail: qs('#accountEmail'),
+  autoRefreshIndicator: qs('#autoRefreshIndicator'),
+  transactionList: qs('#transactionList'),
+  transactionModal: qs('#transactionModal'),
+  transactionTabs: qa('[data-transaction-tab]'),
+  transactionForms: qa('.transaction-form'),
+  panelDepositForm: qs('#panelDepositForm'),
+  panelWithdrawForm: qs('#panelWithdrawForm'),
+  panelTransferForm: qs('#panelTransferForm'),
+  transactionPanelButtons: qa('[data-transaction-panel-btn]'),
+  transactionPanelForms: qa('[data-transaction-panel]'),
+  closeTransactionBtns: qa('[data-close-transaction]'),
+  transactionFilters: qs('#transactionFilters'),
+  historyButtons: qa('[data-history-range]'),
+  balanceChart: qs('#balanceChart'),
+  copyIbanBtn: qs('[data-action="copy-iban"]'),
+  advisorPhoto: qs('#advisorPhoto'),
+  advisorName: qs('#advisorName'),
+  advisorTitle: qs('#advisorTitle'),
+  advisorPhone: qs('#advisorPhone'),
+  advisorEmail: qs('#advisorEmail'),
+  publicContactSection: qs('#kontakt'),
+  authModal: qs('#authModal'),
+  authTitle: qs('#authTitle'),
+  authSubtitle: qs('#authSubtitle'),
+  loginForm: qs('#loginForm'),
+  registerForm: qs('#registerForm'),
+  authFeedback: qs('#authFeedback'),
+  keyUnlockModal: qs('#keyUnlockModal'),
+  keyUnlockForm: qs('#keyUnlockForm'),
+  keyUnlockPassword: qs('#keyUnlockPassword'),
+  keyUnlockFeedback: qs('#keyUnlockFeedback'),
+  toast: qs('#toast'),
+};
+
+const transactionLabels = {
+  deposit: 'Einzahlung',
+  withdraw: 'Auszahlung',
+  transfer_in: 'Überweisung Eingang',
+  transfer_out: 'Überweisung Ausgang',
+};
+
+const ADVISOR_FALLBACK = {
+  name: 'Sven Meyer',
+  title: 'Senior Kundenberater',
+  phone: '0711 204010',
+  email: 'sven.meyer@altebank.de',
+  image: 'assets/advisors/advisor-1.svg',
+};
+
+const euro = new Intl.NumberFormat('de-DE', { style: 'currency', currency: 'EUR' });
+const AUTO_REFRESH_INTERVAL = 15000;
+const INACTIVITY_TIMEOUT_MS = 5 * 60 * 1000;
+const INACTIVITY_WARNING_THRESHOLD_MS = 60 * 1000;
+const ACTIVITY_RESET_THROTTLE_MS = 1500;
+const INACTIVITY_EVENTS = ['pointerdown', 'pointermove', 'keydown', 'touchstart', 'wheel'];
+const INACTIVITY_EVENT_OPTIONS = { passive: true };
+
+let toastTimer = null;
+let autoRefreshTimer = null;
+let loadAccountInFlight = null;
+let lastRefreshAt = null;
+let balanceChartInstance = null;
+let brandLogoRaf = null;
+let inactivityTimeoutId = null;
+let inactivityIntervalId = null;
+let inactivityDeadline = null;
+let inactivityListenersAttached = false;
+let lastActivityResetAt = 0;
+let keyUnlockDeferred = null;
+let keyUnlockResyncAttempted = false;
+
+function showToast(message, type = 'info') {
+  if (!elements.toast) return;
+  const toast = elements.toast;
+  toast.textContent = message;
+  toast.classList.remove('hidden', 'toast--error', 'toast--success');
+  if (type === 'error') {
+    toast.classList.add('toast--error');
+  } else if (type === 'success') {
+    toast.classList.add('toast--success');
+  }
+  if (toastTimer) window.clearTimeout(toastTimer);
+  toastTimer = window.setTimeout(() => {
+    toast.classList.add('hidden');
+    toast.classList.remove('toast--error', 'toast--success');
+  }, 3200);
+}
+
+function formatCurrency(value) {
+  if (value === undefined || value === null) return euro.format(0);
+  const parsed = Number(value);
+  if (Number.isNaN(parsed)) return euro.format(0);
+  return euro.format(parsed);
+}
+
+function formatDisplayName(profile) {
+  if (!profile) return '';
+  const first = (profile.firstName ?? profile.first_name ?? '').trim();
+  const last = (profile.lastName ?? profile.last_name ?? '').trim();
+  const combined = [first, last].filter(Boolean).join(' ').trim();
+  if (combined) {
+    return combined;
+  }
+  const fallback = (profile.email ?? profile.username ?? '').trim();
+  return fallback;
+}
+
+function formatInitial(label) {
+  return label?.trim().charAt(0)?.toUpperCase() || 'A';
+}
+
+function syncBodyScrollLock() {
+  const modals = [
+    elements.authModal,
+    elements.transactionModal,
+    elements.accountSettingsModal,
+    elements.keyUnlockModal,
+  ];
+  const lock = modals.some((modal) => modal && !modal.classList.contains('hidden'));
+  document.body.style.overflow = lock ? 'hidden' : '';
+}
+
+function syncBrandLogoSize() {
+  if (brandLogoRaf) {
+    window.cancelAnimationFrame(brandLogoRaf);
+  }
+  brandLogoRaf = window.requestAnimationFrame(() => {
+    brandLogoRaf = null;
+    const nav = elements.topNav;
+    const wrapper = elements.brandLogoWrapper;
+    if (!nav || !wrapper) {
+      return;
+    }
+
+    const navHeight = Math.max(0, nav.getBoundingClientRect().height || 0);
+    if (!navHeight) {
+      return;
+    }
+
+    const logo = wrapper.querySelector('.brand__logo');
+    const naturalWidth = logo?.naturalWidth || 0;
+    const naturalHeight = logo?.naturalHeight || 0;
+    const aspectRatio = naturalWidth > 0 && naturalHeight > 0 ? naturalWidth / naturalHeight : 1;
+
+    const targetHeight = Math.max(36, Math.round(navHeight * 0.44));
+    const targetWidth = Math.max(36, Math.round(targetHeight * aspectRatio));
+    const offset = -Math.round(targetWidth * 0.25);
+
+    wrapper.style.height = `${targetHeight}px`;
+    wrapper.style.width = `${targetWidth}px`;
+    wrapper.style.marginLeft = `${offset}px`;
+  });
+}
+
+function ensureArgon2Available() {
+  if (window.AlteBankArgon2 && typeof window.AlteBankArgon2.hash === 'function') {
+    return Promise.resolve(window.AlteBankArgon2);
+  }
+  if (window.AlteBankArgon2Load) {
+    return window.AlteBankArgon2Load.then((adapter) => {
+      if (adapter && typeof adapter.hash === 'function') {
+        if (DEBUG) {
+          console.debug('[app] Argon2 erfolgreich geladen.');
+        }
+        return adapter;
+      }
+      throw new Error('Argon2 konnte nicht initialisiert werden.');
+    }).catch((error) => {
+      if (DEBUG) {
+        console.error('[app] Argon2 konnte nicht geladen werden:', error);
+      }
+      throw new Error('Argon2 konnte nicht geladen werden.');
+    });
+  }
+  return Promise.reject(new Error('Argon2 nicht verfügbar.'));
+}
+
+function updateSessionTimerDisplay() {
+  if (!elements.sessionTimer) {
+    return;
+  }
+  if (!state.token || !inactivityDeadline) {
+    elements.sessionTimer.textContent = '';
+    elements.sessionTimer.classList.add('hidden');
+    elements.sessionTimer.classList.remove('session-timer--warning');
+    elements.sessionTimer.removeAttribute('title');
+    elements.sessionTimer.removeAttribute('aria-label');
+    return;
+  }
+
+  const remainingMs = Math.max(0, inactivityDeadline - Date.now());
+  const totalSeconds = Math.max(0, Math.ceil(remainingMs / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  const formatted = `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+
+  elements.sessionTimer.textContent = formatted;
+  elements.sessionTimer.classList.remove('hidden');
+  elements.sessionTimer.classList.toggle('session-timer--warning', remainingMs <= INACTIVITY_WARNING_THRESHOLD_MS);
+
+  const minuteLabel = minutes === 1 ? '1 Minute' : `${minutes} Minuten`;
+  const secondLabel = seconds === 1 ? '1 Sekunde' : `${seconds} Sekunden`;
+  let readable;
+  if (totalSeconds === 0) {
+    readable = 'wenigen Sekunden';
+  } else if (minutes === 0) {
+    readable = secondLabel;
+  } else if (seconds === 0) {
+    readable = minuteLabel;
+  } else {
+    readable = `${minuteLabel} und ${secondLabel}`;
+  }
+  elements.sessionTimer.setAttribute('aria-label', `Automatische Abmeldung in ${readable}`);
+  elements.sessionTimer.setAttribute('title', `Auto-Logout in ${formatted}`);
+}
+
+function stopInactivityTimer() {
+  if (inactivityTimeoutId) {
+    window.clearTimeout(inactivityTimeoutId);
+    inactivityTimeoutId = null;
+  }
+  if (inactivityIntervalId) {
+    window.clearInterval(inactivityIntervalId);
+    inactivityIntervalId = null;
+  }
+  inactivityDeadline = null;
+  lastActivityResetAt = 0;
+  if (elements.sessionTimer) {
+    elements.sessionTimer.textContent = '';
+    elements.sessionTimer.classList.add('hidden');
+    elements.sessionTimer.classList.remove('session-timer--warning');
+    elements.sessionTimer.removeAttribute('title');
+    elements.sessionTimer.removeAttribute('aria-label');
+  }
+}
+
+function handleInactivityLogout() {
+  stopInactivityTimer();
+  if (!state.token) {
+    return;
+  }
+  clearSession({ silent: true });
+  showToast('Du wurdest wegen Inaktivität abgemeldet.', 'info');
+}
+
+function resetInactivityTimer() {
+  if (!state.token) {
+    stopInactivityTimer();
+    return;
+  }
+  const now = Date.now();
+  lastActivityResetAt = now;
+  inactivityDeadline = now + INACTIVITY_TIMEOUT_MS;
+
+  if (inactivityTimeoutId) {
+    window.clearTimeout(inactivityTimeoutId);
+  }
+  if (inactivityIntervalId) {
+    window.clearInterval(inactivityIntervalId);
+  }
+
+  inactivityTimeoutId = window.setTimeout(handleInactivityLogout, INACTIVITY_TIMEOUT_MS);
+  inactivityIntervalId = window.setInterval(updateSessionTimerDisplay, 1000);
+  updateSessionTimerDisplay();
+}
+
+function handleUserActivity() {
+  if (!state.token) {
+    return;
+  }
+  const now = Date.now();
+  if (now - lastActivityResetAt < ACTIVITY_RESET_THROTTLE_MS) {
+    return;
+  }
+  resetInactivityTimer();
+}
+
+function attachInactivityListeners() {
+  if (inactivityListenersAttached) {
+    return;
+  }
+  INACTIVITY_EVENTS.forEach((event) => {
+    document.addEventListener(event, handleUserActivity, INACTIVITY_EVENT_OPTIONS);
+  });
+  window.addEventListener('focus', handleUserActivity);
+  inactivityListenersAttached = true;
+}
+
+function detachInactivityListeners() {
+  if (!inactivityListenersAttached) {
+    return;
+  }
+  INACTIVITY_EVENTS.forEach((event) => {
+    document.removeEventListener(event, handleUserActivity, INACTIVITY_EVENT_OPTIONS);
+  });
+  window.removeEventListener('focus', handleUserActivity);
+  inactivityListenersAttached = false;
+}
+
+function activateSection(key, { scroll = true } = {}) {
+  if (!elements.dashboardSections.length) {
+    return;
+  }
+
+  const previous = state.activeSection;
+  const hasChanged = previous !== key;
+  state.activeSection = key;
+
+  elements.dashboardSections.forEach((section) => {
+    const isActive = section.dataset.section === key;
+    section.classList.toggle('hidden', !isActive);
+    if (isActive && scroll && hasChanged) {
+      section.scrollIntoView({ block: 'start', behavior: 'smooth' });
+    }
+  });
+
+  elements.navSectionButtons.forEach((button) => {
+    const isActive = button.dataset.navSection === key;
+    button.classList.toggle('is-active', isActive);
+    button.setAttribute('aria-pressed', String(isActive));
+  });
+
+  if (key === 'overview' && (hasChanged || state.sectionNeedsUpdate.overview)) {
+    refreshTransactionList();
+    state.sectionNeedsUpdate.overview = false;
+  }
+
+  if (key === 'history' && (hasChanged || state.sectionNeedsUpdate.history)) {
+    updateHistoryChart();
+    state.sectionNeedsUpdate.history = false;
+  }
+}
+
+function sanitizeIban(value) {
+  if (typeof value !== 'string') {
+    return '';
+  }
+  return value.replace(/\s+/g, '').toUpperCase();
+}
+
+function formatIbanForDisplay(value) {
+  const sanitized = sanitizeIban(value);
+  if (!sanitized) {
+    return '';
+  }
+  const grouped = sanitized.match(/.{1,4}/g);
+  return grouped ? grouped.join(' ') : sanitized;
+}
+
+async function apiFetch(path, { method = 'GET', body, headers } = {}) {
+  const config = {
+    method,
+    headers: {
+      ...(headers || {}),
+    },
+  };
+  if (body !== undefined) {
+    config.headers['Content-Type'] = 'application/json';
+    config.body = JSON.stringify(body);
+  }
+  if (state.token) {
+    config.headers.Authorization = `Bearer ${state.token}`;
+  }
+  if (DEBUG) {
+    console.debug('[apiFetch] request', { path, method, body });
+  }
+  const response = await fetch(path, config);
+  const isJson = response.headers.get('content-type')?.includes('application/json');
+  const payload = isJson ? await response.json() : {};
+  if (DEBUG) {
+    console.debug('[apiFetch] response', { path, method, status: response.status, payload });
+  }
+  if (!response.ok) {
+    const message = payload?.error || `Request fehlgeschlagen (${response.status})`;
+    const error = new Error(message);
+    error.status = response.status;
+    throw error;
+  }
+  return payload;
+}
+
+function setFormBusy(form, busy) {
+  if (!form) return;
+  qa('input, button', form).forEach((el) => {
+    el.disabled = busy;
+  });
+}
+
+function openModal(mode = 'login') {
+  if (!elements.authModal) return;
+  switchAuthMode(mode);
+  elements.authModal.classList.remove('hidden');
+  syncBodyScrollLock();
+  window.requestAnimationFrame(() => {
+    if (mode === 'login') {
+      elements.loginForm?.querySelector('input')?.focus();
+    } else {
+      elements.registerForm?.querySelector('input')?.focus();
+    }
+  });
+}
+
+function closeModal() {
+  if (!elements.authModal) return;
+  elements.authModal.classList.add('hidden');
+  syncBodyScrollLock();
+}
+
+function switchAuthMode(mode) {
+  if (!elements.loginForm || !elements.registerForm) return;
+  const isLogin = mode === 'login';
+  elements.authTitle.textContent = isLogin ? 'Willkommen zurück' : 'In wenigen Sekunden startklar';
+  elements.authSubtitle.textContent = isLogin
+    ? 'Melde dich mit deinen Zugangsdaten an.'
+    : 'Erstelle ein Konto und starte mit deinem Wunschguthaben.';
+  elements.loginForm.classList.toggle('hidden', !isLogin);
+  elements.registerForm.classList.toggle('hidden', isLogin);
+  elements.authFeedback.textContent = '';
+  elements.authModal.dataset.mode = mode;
+}
+
+function updateAuthState(isAuthenticated, profile, options = {}) {
+  const { preserveSection = false } = options;
+  const wasAuthenticated = document.body.classList.contains('is-authenticated');
+
+  document.body.classList.toggle('is-authenticated', isAuthenticated);
+  elements.landing?.classList.toggle('hidden', isAuthenticated);
+  elements.guestNav?.classList.toggle('hidden', isAuthenticated);
+  elements.userNav?.classList.toggle('hidden', !isAuthenticated);
+  elements.publicContactSection?.classList.toggle('hidden', isAuthenticated);
+
+  if (isAuthenticated) {
+    elements.guestActions?.classList.add('hidden');
+    elements.userActions?.classList.remove('hidden');
+    elements.dashboard?.classList.remove('hidden');
+    const displayName = formatDisplayName(profile) || 'Konto';
+    const initial = formatInitial(displayName || 'K');
+    elements.userInitial.textContent = initial;
+    elements.currentUser.textContent = displayName;
+
+    if (!preserveSection || !wasAuthenticated) {
+      state.activeSection = 'overview';
+    }
+    activateSection(state.activeSection, { scroll: !preserveSection || !wasAuthenticated });
+    attachInactivityListeners();
+    if (!wasAuthenticated) {
+      resetInactivityTimer();
+    } else {
+      updateSessionTimerDisplay();
+    }
+  } else {
+    elements.guestActions?.classList.remove('hidden');
+    elements.userActions?.classList.add('hidden');
+    elements.dashboard?.classList.add('hidden');
+    elements.userInitial.textContent = 'A';
+    elements.currentUser.textContent = 'Konto';
+    state.activeSection = 'overview';
+    elements.navSectionButtons.forEach((button) => {
+      button.classList.remove('is-active');
+      button.setAttribute('aria-pressed', 'false');
+    });
+    stopInactivityTimer();
+    detachInactivityListeners();
+  }
+  syncBrandLogoSize();
+}
+
+function setKeyUnlockFeedback(message = '', type = 'error') {
+  if (!elements.keyUnlockFeedback) {
+    return;
+  }
+  const feedback = elements.keyUnlockFeedback;
+  feedback.textContent = message;
+  feedback.classList.remove('form-feedback--error', 'form-feedback--success');
+  if (!message) {
+    return;
+  }
+  if (type === 'success') {
+    feedback.classList.add('form-feedback--success');
+  } else if (type === 'error') {
+    feedback.classList.add('form-feedback--error');
+  }
+}
+
+function setKeyUnlockBusy(busy) {
+  if (!elements.keyUnlockForm) {
+    return;
+  }
+  if (elements.keyUnlockPassword) {
+    elements.keyUnlockPassword.disabled = busy;
+  }
+  const submitBtn = elements.keyUnlockForm.querySelector('button[type="submit"]');
+  if (submitBtn) {
+    submitBtn.disabled = busy;
+  }
+}
+
+function settleKeyUnlock({ resolved = false, result, reason } = {}) {
+  if (!keyUnlockDeferred) {
+    return;
+  }
+  const { resolve, reject } = keyUnlockDeferred;
+  keyUnlockDeferred = null;
+  if (resolved) {
+    resolve?.(result);
+    return;
+  }
+  const error = reason instanceof Error ? reason : new Error('Signatur abgebrochen.');
+  reject?.(error);
+}
+
+function closeKeyUnlockModal({ resolved = false, result, reason } = {}) {
+  const modal = elements.keyUnlockModal;
+  if (modal && !modal.classList.contains('hidden')) {
+    modal.classList.add('hidden');
+    syncBodyScrollLock();
+  }
+  keyUnlockResyncAttempted = false;
+  setKeyUnlockBusy(false);
+  setKeyUnlockFeedback('');
+  elements.keyUnlockForm?.reset();
+  settleKeyUnlock({ resolved, result, reason });
+}
+
+function requestKeyUnlock() {
+  if (!state.signingAvailable) {
+    return Promise.reject(new Error('Digitale Signatur wird nicht unterstützt.'));
+  }
+  if (keyUnlockDeferred) {
+    return keyUnlockDeferred.promise;
+  }
+  if (!elements.keyUnlockModal || !elements.keyUnlockForm) {
+    return Promise.reject(new Error('Entsperrdialog nicht verfügbar.'));
+  }
+  if (!state.keyMaterial?.encryptedPrivateKey) {
+    return Promise.reject(new Error('Kein Schlüsselmaterial vorhanden.'));
+  }
+
+  setKeyUnlockBusy(false);
+  setKeyUnlockFeedback('');
+  elements.keyUnlockForm.reset();
+  keyUnlockResyncAttempted = false;
+
+  const deferred = {};
+  deferred.promise = new Promise((resolve, reject) => {
+    deferred.resolve = resolve;
+    deferred.reject = reject;
+  });
+  keyUnlockDeferred = deferred;
+
+  elements.keyUnlockModal.classList.remove('hidden');
+  syncBodyScrollLock();
+  window.requestAnimationFrame(() => {
+    elements.keyUnlockPassword?.focus();
+  });
+
+  return deferred.promise;
+}
+
+function clearSession(options = { silent: false }) {
+  stopAutoRefresh();
+  stopInactivityTimer();
+  detachInactivityListeners();
+  closeKeyUnlockModal({ resolved: false, reason: new Error('Session beendet.') });
+  setKeyMaterial(null);
+  state.bankPublicKey = 'BANK_SYSTEM';
+  state.token = null;
+  state.account = null;
+  state.transactions = [];
+  state.sectionNeedsUpdate = {
+    overview: false,
+    history: false,
+  };
+  resetFilters();
+  window.localStorage.removeItem('altebank_session');
+  lastRefreshAt = null;
+  if (balanceChartInstance) {
+    balanceChartInstance.destroy();
+    balanceChartInstance = null;
+  }
+  updateAuthState(false, null);
+  updateBalances();
+  updateAccountMeta();
+  updateAdvisorCard();
+  populateAccountSettingsForms();
+  updateAutoRefreshIndicator();
+  closeTransactionModal();
+  if (!options.silent) {
+    showToast('Du wurdest abgemeldet.', 'info');
+  }
+}
+
+function updateBalances() {
+  const balance = state.account?.balance ?? '0.00';
+  elements.balanceValue.textContent = formatCurrency(balance);
+  elements.heroBalance.textContent = formatCurrency(balance);
+}
+
+function updateAccountMeta() {
+  if (!elements.accountHolder || !elements.accountIban || !elements.accountEmail) {
+    return;
+  }
+  const placeholder = '-';
+  const account = state.account;
+  if (!account) {
+    elements.accountHolder.textContent = placeholder;
+    elements.accountIban.textContent = placeholder;
+    elements.accountEmail.textContent = placeholder;
+    if (elements.copyIbanBtn) {
+      elements.copyIbanBtn.disabled = true;
+    }
+    return;
+  }
+
+  const displayName = formatDisplayName(account) || placeholder;
+  elements.accountHolder.textContent = displayName;
+  elements.accountIban.textContent = formatIbanForDisplay(account.iban) || placeholder;
+  elements.accountEmail.textContent = account.email || placeholder;
+  if (elements.copyIbanBtn) {
+    elements.copyIbanBtn.disabled = !account.iban;
+  }
+}
+
+function updateAdvisorCard() {
+  if (!elements.advisorName || !elements.advisorTitle || !elements.advisorPhone || !elements.advisorEmail || !elements.advisorPhoto) {
+    return;
+  }
+
+  const advisor = state.account?.advisor || null;
+  const profile = advisor || ADVISOR_FALLBACK;
+
+  elements.advisorName.textContent = profile.name || ADVISOR_FALLBACK.name;
+  elements.advisorTitle.textContent = profile.title || ADVISOR_FALLBACK.title;
+  elements.advisorPhone.textContent = profile.phone || ADVISOR_FALLBACK.phone;
+
+  const email = profile.email || ADVISOR_FALLBACK.email;
+  elements.advisorEmail.textContent = email;
+  elements.advisorEmail.setAttribute('href', `mailto:${email}`);
+
+  const imageSrc = profile.image || ADVISOR_FALLBACK.image;
+  elements.advisorPhoto.setAttribute('src', imageSrc);
+  const altLabel = profile.name ? `Porträt von ${profile.name}` : 'Beratungsteam der AlteBank';
+  elements.advisorPhoto.setAttribute('alt', altLabel);
+}
+
+function updateAutoRefreshIndicator() {
+  if (!elements.autoRefreshIndicator) {
+    return;
+  }
+  if (!state.token) {
+    elements.autoRefreshIndicator.textContent = 'Nicht angemeldet';
+    return;
+  }
+  if (!lastRefreshAt) {
+    elements.autoRefreshIndicator.textContent = 'Automatische Aktualisierung aktiv';
+    return;
+  }
+  const formatted = new Intl.DateTimeFormat('de-DE', {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  }).format(lastRefreshAt);
+  elements.autoRefreshIndicator.textContent = `Zuletzt aktualisiert: ${formatted}`;
+}
+
+function startAutoRefresh() {
+  if (!state.token || autoRefreshTimer) {
+    return;
+  }
+  autoRefreshTimer = window.setInterval(() => {
+    if (!state.token || document.hidden) {
+      return;
+    }
+    loadAccount({ silent: true });
+  }, AUTO_REFRESH_INTERVAL);
+  updateAutoRefreshIndicator();
+}
+
+function stopAutoRefresh() {
+  if (autoRefreshTimer) {
+    window.clearInterval(autoRefreshTimer);
+    autoRefreshTimer = null;
+  }
+}
+
+function applyTransactionFilters(transactions) {
+  const { type, from, to, min, max } = state.filters;
+  const parsedFrom = from ? new Date(`${from}T00:00:00`) : null;
+  const parsedTo = to ? new Date(`${to}T23:59:59.999`) : null;
+  const fromDate = parsedFrom && !Number.isNaN(parsedFrom.getTime()) ? parsedFrom : null;
+  const toDate = parsedTo && !Number.isNaN(parsedTo.getTime()) ? parsedTo : null;
+  const minAmount = min === '' ? null : Number(min);
+  const maxAmount = max === '' ? null : Number(max);
+
+  return transactions.filter((txn) => {
+    if (type && txn.type !== type) {
+      return false;
+    }
+
+    const txnDate = txn.createdAt ? new Date(txn.createdAt) : null;
+    if (fromDate && (!txnDate || txnDate < fromDate)) {
+      return false;
+    }
+    if (toDate && (!txnDate || txnDate > toDate)) {
+      return false;
+    }
+
+    const amount = Number(txn.amount);
+    const absAmount = Math.abs(amount);
+    if (minAmount !== null && !Number.isNaN(minAmount) && absAmount < minAmount) {
+      return false;
+    }
+    if (maxAmount !== null && !Number.isNaN(maxAmount) && absAmount > maxAmount) {
+      return false;
+    }
+
+    return true;
+  });
+}
+
+function refreshTransactionList() {
+  const list = elements.transactionList;
+  if (!list) return;
+
+  const transactions = applyTransactionFilters(state.transactions || []);
+  list.innerHTML = '';
+
+  if (!transactions.length) {
+    const item = document.createElement('li');
+    item.className = 'transaction transaction--empty';
+    item.textContent = 'Keine Transaktionen für den aktuellen Filter.';
+    list.appendChild(item);
+    return;
+  }
+
+  transactions.forEach((txn) => {
+    const amountNumber = Number(txn.amount);
+    const item = document.createElement('li');
+    item.className = `transaction ${amountNumber >= 0 ? 'transaction--positive' : 'transaction--negative'}`;
+
+    const header = document.createElement('div');
+    header.className = 'transaction__header';
+    const label = transactionLabels[txn.type] || 'Transaktion';
+    header.innerHTML = `<span>${label}</span><time datetime="${txn.createdAt}">${formatDate(txn.createdAt)}</time>`;
+
+    const amount = document.createElement('div');
+    amount.className = 'transaction__amount';
+    amount.textContent = formatCurrency(amountNumber);
+
+    const memo = document.createElement('div');
+    memo.className = 'transaction__memo';
+    memo.textContent = txn.memo || '';
+
+    const counterpartyName = txn.counterpartyName || '';
+    const counterpartyIban = txn.counterpartyIban || '';
+    let counterparty;
+    if (counterpartyName || counterpartyIban) {
+      counterparty = document.createElement('div');
+      counterparty.className = 'transaction__counterparty';
+      const parts = [];
+      if (counterpartyName) {
+        parts.push(counterpartyName);
+      }
+      if (counterpartyIban) {
+        parts.push(counterpartyIban);
+      }
+      counterparty.textContent = parts.join(' · ');
+    }
+
+    const balance = document.createElement('div');
+    balance.className = 'transaction__balance';
+    balance.textContent = `Neues Guthaben: ${formatCurrency(txn.balance)}`;
+
+    if (counterparty) {
+      item.append(header, amount, memo, counterparty, balance);
+    } else {
+      item.append(header, amount, memo, balance);
+    }
+    list.appendChild(item);
+  });
+}
+
+function formatDate(isoString) {
+  if (!isoString) return '';
+  const date = new Date(isoString);
+  if (Number.isNaN(date.getTime())) return '';
+  return new Intl.DateTimeFormat('de-DE', {
+    dateStyle: 'medium',
+    timeStyle: 'short',
+  }).format(date);
+}
+
+async function loadAccount({ silent = false } = {}) {
+  if (!state.token) {
+    return undefined;
+  }
+  if (loadAccountInFlight) {
+    return loadAccountInFlight;
+  }
+
+  loadAccountInFlight = (async () => {
+    try {
+      const data = await apiFetch('/api/accounts/me');
+      setKeyMaterial({
+        publicKey: data.publicKey,
+        encryptedPrivateKey: data.encryptedPrivateKey,
+        keyCreatedAt: data.keyCreatedAt,
+        bankPublicKey: data.bankPublicKey,
+      });
+      const normalized = {
+        ...data,
+        firstName: data.firstName ?? data.first_name ?? '',
+        lastName: data.lastName ?? data.last_name ?? '',
+        transactions: Array.isArray(data.transactions) ? data.transactions : [],
+      };
+      const hadAccount = Boolean(state.account);
+      normalized.email = (data.email ?? '').toString().trim().toLowerCase();
+      normalized.iban = sanitizeIban(normalized.iban ?? data.iban);
+      normalized.advisor = data.advisor || null;
+      state.account = normalized;
+      state.transactions = normalized.transactions;
+      updateAuthState(true, normalized, { preserveSection: hadAccount });
+      updateBalances();
+      updateAccountMeta();
+      updateAdvisorCard();
+      populateAccountSettingsForms();
+
+      if (state.activeSection === 'overview') {
+        refreshTransactionList();
+        state.sectionNeedsUpdate.overview = false;
+      } else {
+        state.sectionNeedsUpdate.overview = true;
+      }
+
+      if (state.activeSection === 'history') {
+        updateHistoryChart();
+        state.sectionNeedsUpdate.history = false;
+      } else {
+        state.sectionNeedsUpdate.history = true;
+      }
+
+      lastRefreshAt = new Date();
+      updateAutoRefreshIndicator();
+      startAutoRefresh();
+      if (!silent) {
+        showToast('Dashboard aktualisiert.', 'success');
+      }
+      return normalized;
+    } catch (error) {
+      if (error.status === 401) {
+        clearSession({ silent: true });
+        return null;
+      }
+      showToast(error.message, 'error');
+      throw error;
+    } finally {
+      loadAccountInFlight = null;
+    }
+  })();
+
+  return loadAccountInFlight;
+}
+
+function persistToken(token) {
+  state.token = token;
+  window.localStorage.setItem('altebank_session', token);
+}
+
+function attachModalHandlers() {
+  qa('[data-open-auth]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const mode = btn.dataset.openAuth || 'login';
+      openModal(mode);
+    });
+  });
+
+  qa('[data-close-modal]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      closeModal();
+    });
+  });
+
+  qa('[data-switch-form]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      switchAuthMode(btn.dataset.switchForm);
+    });
+  });
+
+  elements.authModal?.addEventListener('click', (event) => {
+    if (event.target.dataset?.closeModal !== undefined) {
+      closeModal();
+    }
+  });
+
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && !elements.authModal.classList.contains('hidden')) {
+      closeModal();
+    }
+  });
+}
+
+function switchTransactionTab(key = 'deposit') {
+  if (!key) return;
+  elements.transactionTabs.forEach((tab) => {
+    const isActive = tab.dataset.transactionTab === key;
+    tab.classList.toggle('is-active', isActive);
+    tab.setAttribute('aria-selected', String(isActive));
+    tab.setAttribute('tabindex', isActive ? '0' : '-1');
+  });
+
+  elements.transactionForms.forEach((form) => {
+    const isActive = form.dataset.transactionPanel === key;
+    form.classList.toggle('hidden', !isActive);
+    form.setAttribute('aria-hidden', String(!isActive));
+    if (isActive && !elements.transactionModal?.classList.contains('hidden')) {
+      window.requestAnimationFrame(() => {
+        form.querySelector('input, select, button')?.focus();
+      });
+    }
+  });
+}
+
+function switchDashboardTransaction(type = 'transfer') {
+  if (!type) {
+    return;
+  }
+
+  elements.transactionPanelButtons.forEach((button) => {
+    const isActive = button.dataset.transactionPanelBtn === type;
+    button.classList.toggle('is-active', isActive);
+    button.setAttribute('aria-pressed', String(isActive));
+    button.setAttribute('aria-selected', String(isActive));
+    button.setAttribute('tabindex', isActive ? '0' : '-1');
+  });
+
+  elements.transactionPanelForms.forEach((form) => {
+    const isActive = form.dataset.transactionPanel === type;
+    form.classList.toggle('hidden', !isActive);
+    form.setAttribute('aria-hidden', String(!isActive));
+    if (isActive && state.activeSection === 'transactions') {
+      window.requestAnimationFrame(() => {
+        form.querySelector('input, select, button')?.focus({ preventScroll: false });
+      });
+    }
+  });
+}
+
+function closeTransactionModal() {
+  if (!elements.transactionModal) return;
+  elements.transactionModal.classList.add('hidden');
+  syncBodyScrollLock();
+}
+
+function attachTransactionModalHandlers() {
+  elements.closeTransactionBtns.forEach((btn) => {
+    btn.addEventListener('click', () => {
+      closeTransactionModal();
+    });
+  });
+
+  elements.transactionModal?.addEventListener('click', (event) => {
+    if (event.target.dataset?.closeTransaction !== undefined) {
+      closeTransactionModal();
+    }
+  });
+
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && !elements.transactionModal?.classList.contains('hidden')) {
+      closeTransactionModal();
+    }
+  });
+
+  elements.transactionTabs.forEach((tab) => {
+    tab.addEventListener('click', () => {
+      switchTransactionTab(tab.dataset.transactionTab);
+    });
+  });
+
+  switchTransactionTab('deposit');
+}
+
+function attachDashboardTransactionHandlers() {
+  if (!elements.transactionPanelButtons.length) {
+    return;
+  }
+
+  elements.transactionPanelButtons.forEach((button) => {
+    button.addEventListener('click', () => {
+      const type = button.dataset.transactionPanelBtn;
+      if (!type) {
+        return;
+      }
+      switchDashboardTransaction(type);
+    });
+  });
+
+  switchDashboardTransaction('transfer');
+}
+
+function handleFilterChange(event) {
+  const target = event.target;
+  if (!(target instanceof HTMLInputElement) && !(target instanceof HTMLSelectElement)) {
+    return;
+  }
+  if (!target.name) return;
+  state.filters = {
+    ...state.filters,
+    [target.name]: target.value,
+  };
+  refreshTransactionList();
+}
+
+function resetFilters(event) {
+  event?.preventDefault();
+  state.filters = {
+    type: '',
+    from: '',
+    to: '',
+    min: '',
+    max: '',
+  };
+  elements.transactionFilters?.reset();
+  refreshTransactionList();
+}
+
+function attachFilterHandlers() {
+  if (!elements.transactionFilters) return;
+  elements.transactionFilters.addEventListener('input', handleFilterChange);
+  elements.transactionFilters.addEventListener('change', handleFilterChange);
+
+  const resetBtn = qs('[data-action="reset-filters"]');
+  resetBtn?.addEventListener('click', resetFilters);
+}
+
+function attachNavigationHandlers() {
+  if (!elements.navSectionButtons.length) {
+    return;
+  }
+  elements.navSectionButtons.forEach((button) => {
+    button.addEventListener('click', () => {
+      if (!state.token) {
+        openModal('login');
+        return;
+      }
+      activateSection(button.dataset.navSection || 'overview');
+    });
+  });
+}
+
+function attachAccountMetaHandlers() {
+  elements.copyIbanBtn?.addEventListener('click', async () => {
+    const iban = sanitizeIban(state.account?.iban);
+    if (!iban) {
+      showToast('Keine IBAN verfügbar.', 'error');
+      return;
+    }
+
+    try {
+      const clipboard = window.navigator?.clipboard;
+      if (clipboard?.writeText) {
+        await clipboard.writeText(iban);
+      } else {
+        const scratch = document.createElement('textarea');
+        scratch.value = iban;
+        scratch.setAttribute('readonly', 'true');
+        scratch.style.position = 'absolute';
+        scratch.style.left = '-9999px';
+        document.body.appendChild(scratch);
+        scratch.select();
+        document.execCommand('copy');
+        document.body.removeChild(scratch);
+      }
+      showToast('IBAN kopiert.', 'success');
+    } catch (copyError) {
+      if (DEBUG) {
+        console.warn('[clipboard] IBAN konnte nicht kopiert werden', copyError);
+      }
+      showToast('IBAN konnte nicht kopiert werden.', 'error');
+    }
+  });
+}
+
+function setAccountSettingsFeedback(message = '', type = 'info') {
+  if (!elements.accountSettingsFeedback) {
+    return;
+  }
+  elements.accountSettingsFeedback.textContent = message;
+  elements.accountSettingsFeedback.classList.remove('form-feedback--error', 'form-feedback--success');
+  if (!message) {
+    return;
+  }
+  if (type === 'error') {
+    elements.accountSettingsFeedback.classList.add('form-feedback--error');
+  } else if (type === 'success') {
+    elements.accountSettingsFeedback.classList.add('form-feedback--success');
+  }
+}
+
+function populateAccountSettingsForms() {
+  if (elements.accountDeleteIbanHint) {
+    const formattedIban = formatIbanForDisplay(state.account?.iban) || '–';
+    elements.accountDeleteIbanHint.textContent = formattedIban;
+  }
+  if (!state.account) {
+    return;
+  }
+  if (elements.profileForm) {
+    const firstNameInput = elements.profileForm.querySelector('#settingsFirstName');
+    const lastNameInput = elements.profileForm.querySelector('#settingsLastName');
+    const emailInput = elements.profileForm.querySelector('#settingsEmail');
+    if (firstNameInput) {
+      firstNameInput.value = state.account.firstName || '';
+    }
+    if (lastNameInput) {
+      lastNameInput.value = state.account.lastName || '';
+    }
+    if (emailInput) {
+      emailInput.value = state.account.email || '';
+    }
+  }
+}
+
+function switchAccountSettingsTab(key = 'profile') {
+  if (!elements.settingsTabButtons.length || !elements.settingsPanels.length) {
+    return;
+  }
+
+  elements.settingsTabButtons.forEach((button) => {
+    const isActive = button.dataset.settingsTab === key;
+    button.classList.toggle('is-active', isActive);
+    button.setAttribute('aria-pressed', String(isActive));
+    button.setAttribute('aria-selected', String(isActive));
+    button.setAttribute('tabindex', isActive ? '0' : '-1');
+  });
+
+  elements.settingsPanels.forEach((panel) => {
+    const isActive = panel.dataset.settingsPanel === key;
+    panel.classList.toggle('hidden', !isActive);
+    panel.setAttribute('aria-hidden', String(!isActive));
+  });
+}
+
+function openAccountSettings() {
+  if (!elements.accountSettingsModal) {
+    return;
+  }
+  if (!state.token) {
+    openModal('login');
+    return;
+  }
+  populateAccountSettingsForms();
+  elements.passwordForm?.reset();
+  elements.accountDeleteForm?.reset();
+  setAccountSettingsFeedback('');
+  switchAccountSettingsTab('profile');
+  elements.accountSettingsModal.classList.remove('hidden');
+  syncBodyScrollLock();
+  window.requestAnimationFrame(() => {
+    elements.profileForm?.querySelector('input')?.focus();
+  });
+}
+
+function closeAccountSettings() {
+  if (!elements.accountSettingsModal) {
+    return;
+  }
+  elements.accountSettingsModal.classList.add('hidden');
+  syncBodyScrollLock();
+}
+
+function attachAccountSettingsHandlers() {
+  elements.openAccountSettingsBtn?.addEventListener('click', openAccountSettings);
+
+  qa('[data-close-account-settings]').forEach((btn) => {
+    btn.addEventListener('click', closeAccountSettings);
+  });
+
+  elements.settingsTabButtons.forEach((button) => {
+    button.addEventListener('click', () => {
+      const tab = button.dataset.settingsTab;
+      if (!tab) {
+        return;
+      }
+      switchAccountSettingsTab(tab);
+    });
+  });
+
+  elements.accountSettingsModal?.addEventListener('click', (event) => {
+    if (event.target.dataset?.closeAccountSettings !== undefined) {
+      closeAccountSettings();
+    }
+  });
+
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && elements.accountSettingsModal && !elements.accountSettingsModal.classList.contains('hidden')) {
+      closeAccountSettings();
+    }
+  });
+
+  elements.profileForm?.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    if (!state.token) {
+      openModal('login');
+      return;
+    }
+    const formData = getFormValues(elements.profileForm);
+    setAccountSettingsFeedback('');
+    setFormBusy(elements.profileForm, true);
+    try {
+      await apiFetch('/api/accounts/me', {
+        method: 'PUT',
+        body: formData,
+      });
+      showToast('Profil aktualisiert.', 'success');
+      setAccountSettingsFeedback('Profil aktualisiert.', 'success');
+      await loadAccount({ silent: true });
+      populateAccountSettingsForms();
+    } catch (error) {
+      setAccountSettingsFeedback(error.message, 'error');
+      showToast(error.message, 'error');
+    } finally {
+      setFormBusy(elements.profileForm, false);
+    }
+  });
+
+  elements.passwordForm?.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    if (!state.token) {
+      openModal('login');
+      return;
+    }
+    const formData = getFormValues(elements.passwordForm);
+    if (formData.newPassword !== formData.confirmPassword) {
+      setAccountSettingsFeedback('Neue Passwörter stimmen nicht überein.', 'error');
+      return;
+    }
+    setAccountSettingsFeedback('');
+    setFormBusy(elements.passwordForm, true);
+    try {
+      await apiFetch('/api/auth/password', {
+        method: 'PUT',
+        body: {
+          currentPassword: formData.currentPassword,
+          newPassword: formData.newPassword,
+        },
+      });
+      elements.passwordForm.reset();
+      setAccountSettingsFeedback('Passwort aktualisiert.', 'success');
+      showToast('Passwort aktualisiert.', 'success');
+      state.keyPassphrase = formData.newPassword;
+      try {
+        await loadAccount({ silent: true });
+        if (state.signingAvailable) {
+          await unlockPrivateKeyWithPassword(formData.newPassword);
+        }
+      } catch (refreshError) {
+        console.warn('Aktualisierte Schlüssel konnten nicht automatisch geladen werden:', refreshError);
+        state.privateKey = null;
+        if (window.sessionStorage) {
+          window.sessionStorage.removeItem(KEY_STORAGE_KEY);
+        }
+      }
+    } catch (error) {
+      setAccountSettingsFeedback(error.message, 'error');
+      showToast(error.message, 'error');
+    } finally {
+      setFormBusy(elements.passwordForm, false);
+    }
+  });
+
+  elements.accountDeleteIbanInput?.addEventListener('input', () => {
+    const input = elements.accountDeleteIbanInput;
+    if (!input) {
+      return;
+    }
+    const raw = sanitizeIban(input.value);
+    const grouped = raw.match(/.{1,4}/g)?.join(' ') ?? raw;
+    input.value = grouped;
+  });
+
+  elements.accountDeleteForm?.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    if (!state.token) {
+      openModal('login');
+      return;
+    }
+    const formData = getFormValues(elements.accountDeleteForm);
+    const confirmIban = sanitizeIban(formData.confirmIban);
+    const accountIban = sanitizeIban(state.account?.iban);
+    if (!confirmIban) {
+      setAccountSettingsFeedback('Bitte gib deine IBAN ein.', 'error');
+      return;
+    }
+    if (confirmIban.length !== 22) {
+      setAccountSettingsFeedback('IBAN muss vollständig angegeben werden.', 'error');
+      return;
+    }
+    if (!accountIban) {
+      setAccountSettingsFeedback('Konto-IBAN konnte nicht geladen werden.', 'error');
+      return;
+    }
+    if (confirmIban !== accountIban) {
+      setAccountSettingsFeedback('IBAN stimmt nicht mit deinem Konto überein.', 'error');
+      return;
+    }
+    setAccountSettingsFeedback('');
+    setFormBusy(elements.accountDeleteForm, true);
+    try {
+      await apiFetch('/api/accounts/me', {
+        method: 'DELETE',
+        body: { confirmIban },
+      });
+      showToast('Dein Konto wurde gelöscht.', 'success');
+      elements.accountDeleteForm.reset();
+      clearSession({ silent: true });
+      closeAccountSettings();
+    } catch (error) {
+      setAccountSettingsFeedback(error.message, 'error');
+      showToast(error.message, 'error');
+    } finally {
+      setFormBusy(elements.accountDeleteForm, false);
+    }
+  });
+}
+
+function attachKeyUnlockHandlers() {
+  if (!elements.keyUnlockModal) {
+    return;
+  }
+
+  qa('[data-close-key-unlock]').forEach((trigger) => {
+    trigger.addEventListener('click', () => {
+      closeKeyUnlockModal({ resolved: false });
+    });
+  });
+
+  elements.keyUnlockModal.addEventListener('click', (event) => {
+    if (event.target?.dataset?.closeKeyUnlock !== undefined) {
+      closeKeyUnlockModal({ resolved: false });
+    }
+  });
+
+  elements.keyUnlockForm?.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    if (!state.keyMaterial?.encryptedPrivateKey) {
+      setKeyUnlockFeedback('Kein Schlüsselmaterial gefunden. Bitte melde dich erneut an.');
+      return;
+    }
+    const password = elements.keyUnlockPassword?.value.trim();
+    if (!password) {
+      setKeyUnlockFeedback('Bitte gib dein Passwort ein.');
+      elements.keyUnlockPassword?.focus();
+      return;
+    }
+    setKeyUnlockFeedback('');
+    setKeyUnlockBusy(true);
+    try {
+      const bytes = await unlockPrivateKeyWithPassword(password);
+      closeKeyUnlockModal({ resolved: true, result: bytes });
+    } catch (error) {
+      console.warn('Passwort konnte Schlüssel nicht entsperren:', error);
+      let feedbackMessage = 'Passwort konnte den Schlüssel nicht entsperren.';
+      if (error instanceof Error && error.message) {
+        const normalized = error.message.trim();
+        if (normalized && !/Entschlüsselung fehlgeschlagen|Schlüsselmaterial/.test(normalized)) {
+          feedbackMessage = normalized;
+        }
+      }
+      if (!keyUnlockResyncAttempted) {
+        keyUnlockResyncAttempted = true;
+        try {
+          await loadAccount({ silent: true });
+        } catch (syncError) {
+          console.warn('Schlüsselmaterial konnte nicht aktualisiert werden:', syncError);
+        }
+      }
+      setKeyUnlockBusy(false);
+      setKeyUnlockFeedback(feedbackMessage);
+      if (elements.keyUnlockPassword) {
+        elements.keyUnlockPassword.focus();
+        if (typeof elements.keyUnlockPassword.select === 'function') {
+          elements.keyUnlockPassword.select();
+        }
+      }
+    }
+  });
+
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && elements.keyUnlockModal && !elements.keyUnlockModal.classList.contains('hidden')) {
+      closeKeyUnlockModal({ resolved: false });
+    }
+  });
+}
+
+function attachFormHandlers() {
+  elements.loginForm?.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const formData = getFormValues(elements.loginForm);
+    setFormBusy(elements.loginForm, true);
+    elements.authFeedback.textContent = '';
+    try {
+      const result = await apiFetch('/api/auth/login', {
+        method: 'POST',
+        body: formData,
+      });
+      persistToken(result.token);
+      setKeyMaterial(
+        {
+          publicKey: result.publicKey,
+          encryptedPrivateKey: result.encryptedPrivateKey,
+          keyCreatedAt: result.keyCreatedAt,
+        },
+        { password: formData.password },
+      );
+      closeModal();
+      const profile = {
+        firstName: result.firstName,
+        lastName: result.lastName,
+        email: formData.email,
+      };
+      const greeting = formatDisplayName(profile) || 'zurück';
+      showToast(`Willkommen zurück, ${greeting}!`, 'success');
+      await loadAccount({ silent: true });
+    } catch (error) {
+      elements.authFeedback.textContent = error.message;
+      showToast(error.message, 'error');
+    } finally {
+      setFormBusy(elements.loginForm, false);
+    }
+  });
+
+  elements.registerForm?.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const formData = getFormValues(elements.registerForm);
+    setFormBusy(elements.registerForm, true);
+    elements.authFeedback.textContent = '';
+    if (!formData.initialDeposit) {
+      delete formData.initialDeposit;
+    }
+    try {
+      const result = await apiFetch('/api/auth/register', {
+        method: 'POST',
+        body: formData,
+      });
+      persistToken(result.token);
+      setKeyMaterial(
+        {
+          publicKey: result.publicKey,
+          encryptedPrivateKey: result.encryptedPrivateKey,
+          keyCreatedAt: result.keyCreatedAt,
+        },
+        { password: formData.password },
+      );
+      closeModal();
+      const profile = {
+        firstName: formData.firstName || result.firstName,
+        lastName: formData.lastName || result.lastName,
+        email: formData.email,
+      };
+      const greeting = formatDisplayName(profile) || 'bei AlteBank';
+      const ibanMessage = result.iban ? ` Deine IBAN: ${result.iban}` : '';
+      showToast(`Schön, dass du da bist, ${greeting}!${ibanMessage}`, 'success');
+      await loadAccount({ silent: true });
+    } catch (error) {
+      elements.authFeedback.textContent = error.message;
+      showToast(error.message, 'error');
+    } finally {
+      setFormBusy(elements.registerForm, false);
+    }
+  });
+
+  const logoutBtn = qs('[data-action="logout"]');
+  logoutBtn?.addEventListener('click', async () => {
+    if (!state.token) {
+      clearSession({ silent: true });
+      return;
+    }
+    try {
+      await apiFetch('/api/auth/logout', { method: 'POST' });
+    } catch (logoutError) {
+      if (DEBUG) {
+        console.debug('[logout] Serverlogout fehlgeschlagen, Session wird lokal beendet.', logoutError);
+      }
+    } finally {
+      clearSession();
+    }
+  });
+
+  const refreshBtn = qs('[data-action="refresh"]');
+  refreshBtn?.addEventListener('click', () => {
+    loadAccount();
+  });
+
+  const transactionForms = [
+    {
+      form: qs('#depositForm'),
+      endpoint: '/api/accounts/deposit',
+      successMessage: 'Einzahlung verbucht.',
+      closeModalOnSuccess: true,
+      txnType: 'deposit',
+    },
+    {
+      form: qs('#withdrawForm'),
+      endpoint: '/api/accounts/withdraw',
+      successMessage: 'Auszahlung ausgeführt.',
+      closeModalOnSuccess: true,
+      txnType: 'withdraw',
+    },
+    {
+      form: qs('#transferForm'),
+      endpoint: '/api/accounts/transfer',
+      successMessage: 'Überweisung gesendet.',
+      closeModalOnSuccess: true,
+      txnType: 'transfer',
+      beforeSubmit: (data) => ({
+        ...data,
+        targetIban: sanitizeIban(data.targetIban),
+      }),
+      onInit: (cfg) => {
+        const ibanInput = cfg.form?.querySelector('input[name="targetIban"]');
+        ibanInput?.addEventListener('input', () => {
+          const raw = sanitizeIban(ibanInput.value);
+          const grouped = raw.match(/.{1,4}/g)?.join(' ') ?? raw;
+          ibanInput.value = grouped;
+        });
+      },
+    },
+    {
+      form: elements.panelDepositForm,
+      endpoint: '/api/accounts/deposit',
+      successMessage: 'Einzahlung verbucht.',
+      previewType: 'deposit',
+      txnType: 'deposit',
+    },
+    {
+      form: elements.panelWithdrawForm,
+      endpoint: '/api/accounts/withdraw',
+      successMessage: 'Auszahlung ausgeführt.',
+      previewType: 'withdraw',
+      txnType: 'withdraw',
+    },
+    {
+      form: elements.panelTransferForm,
+      endpoint: '/api/accounts/transfer',
+      successMessage: 'Überweisung gesendet.',
+      previewType: 'transfer',
+      txnType: 'transfer',
+      beforeSubmit: (data) => ({
+        ...data,
+        targetIban: sanitizeIban(data.targetIban),
+      }),
+      onInit: (cfg) => {
+        const ibanInput = cfg.form?.querySelector('input[name="targetIban"]');
+        ibanInput?.addEventListener('input', () => {
+          const raw = sanitizeIban(ibanInput.value);
+          const grouped = raw.match(/.{1,4}/g)?.join(' ') ?? raw;
+          ibanInput.value = grouped;
+        });
+      },
+    },
+  ];
+
+  transactionForms.forEach((config) => {
+    setupTransactionForm(config);
+  });
+}
+
+function getCurrentBalanceNumber() {
+  const raw = state.account?.balance ?? '0';
+  const parsed = Number(raw);
+  return Number.isNaN(parsed) ? 0 : parsed;
+}
+
+function updateBalancePreview(type, amountValue) {
+  const previewElement = qs(`[data-preview="${type}"] span`);
+  const container = qs(`[data-preview="${type}"]`);
+  if (!previewElement) {
+    return;
+  }
+  const amount = Number(amountValue);
+  const isValid = !Number.isNaN(amount) && amount > 0 && Boolean(state.account);
+  if (!isValid) {
+    previewElement.textContent = '–';
+    container?.classList.add('hidden');
+    container?.classList.toggle('balance-preview--negative', false);
+    return;
+  }
+  const currentBalance = getCurrentBalanceNumber();
+  let projected = currentBalance;
+  if (type === 'deposit') {
+    projected += amount;
+  } else {
+    projected -= amount;
+  }
+  previewElement.textContent = formatCurrency(projected);
+  container?.classList.remove('hidden');
+  container?.classList.toggle('balance-preview--negative', projected < 0);
+}
+
+function setupTransactionForm({
+  form,
+  endpoint,
+  successMessage,
+  closeModalOnSuccess = false,
+  beforeSubmit,
+  previewType,
+  onInit,
+  txnType,
+}) {
+  if (!form) {
+    return;
+  }
+
+  if (typeof onInit === 'function') {
+    onInit({ form });
+  }
+
+  const amountInput = form.querySelector('input[name="amount"]');
+  if (previewType && amountInput) {
+    const refresh = () => updateBalancePreview(previewType, amountInput.value);
+    amountInput.addEventListener('input', refresh);
+    refresh();
+  }
+
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    if (!state.token) {
+      openModal('login');
+      return;
+    }
+
+    const baseData = getFormValues(form);
+    const payload = beforeSubmit ? beforeSubmit({ ...baseData }) : { ...baseData };
+
+    setFormBusy(form, true);
+    try {
+      let requestBody = { ...payload };
+      if (txnType) {
+        if (!state.signingAvailable || !window.AlteBankCrypto) {
+          throw new Error('Digitale Signatur wird von diesem Gerät nicht unterstützt.');
+        }
+        if (!state.keyMaterial?.encryptedPrivateKey) {
+          throw new Error('Kein Schlüsselmaterial vorhanden. Bitte melde dich erneut an.');
+        }
+        const signingData = await signTransactionPayload(txnType, requestBody);
+        requestBody = { ...requestBody, ...signingData };
+      }
+      await apiFetch(endpoint, {
+        method: 'POST',
+        body: requestBody,
+      });
+      form.reset();
+      if (previewType && amountInput) {
+        updateBalancePreview(previewType, '');
+      }
+      showToast(successMessage, 'success');
+      await loadAccount({ silent: true });
+      if (closeModalOnSuccess) {
+        closeTransactionModal();
+      }
+    } catch (error) {
+      showToast(error.message, 'error');
+    } finally {
+      setFormBusy(form, false);
+    }
+  });
+}
+
+function formatChartLabel(date) {
+  return new Intl.DateTimeFormat('de-DE', {
+    day: '2-digit',
+    month: '2-digit',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  }).format(date);
+}
+
+function buildHistorySeries(rangeKey) {
+  const transactions = Array.isArray(state.transactions) ? [...state.transactions] : [];
+  const rangeDays = rangeKey === 'all' ? null : Number(rangeKey);
+  let rangeStart = null;
+  if (rangeDays && Number.isFinite(rangeDays)) {
+    rangeStart = new Date();
+    if (rangeDays <= 1) {
+      rangeStart.setTime(rangeStart.getTime() - 24 * 60 * 60 * 1000);
+    } else {
+      rangeStart.setHours(0, 0, 0, 0);
+      rangeStart.setDate(rangeStart.getDate() - rangeDays);
+    }
+  }
+
+  const sorted = transactions
+    .filter((txn) => txn && txn.createdAt)
+    .map((txn) => ({
+      ...txn,
+      createdAt: new Date(txn.createdAt),
+    }))
+    .filter((txn) => !Number.isNaN(txn.createdAt.getTime()))
+    .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+
+  const filtered = rangeStart
+    ? sorted.filter((txn) => txn.createdAt.getTime() >= rangeStart.getTime())
+    : sorted;
+
+  const labels = [];
+  const values = [];
+  filtered.forEach((txn) => {
+    const balanceNumber = Number(txn.balance);
+    if (Number.isNaN(balanceNumber)) {
+      return;
+    }
+    labels.push(formatChartLabel(txn.createdAt));
+    values.push(balanceNumber);
+  });
+
+  if (!labels.length && state.account) {
+    labels.push(formatChartLabel(new Date()));
+    values.push(getCurrentBalanceNumber());
+  }
+
+  return { labels, values };
+}
+
+function updateHistoryButtons() {
+  elements.historyButtons.forEach((button) => {
+    const isActive = button.dataset.historyRange === state.historyRange;
+    button.classList.toggle('is-active', isActive);
+    button.setAttribute('aria-pressed', String(isActive));
+    button.setAttribute('aria-selected', String(isActive));
+  });
+}
+
+function updateHistoryChart() {
+  if (!elements.balanceChart || typeof window.Chart === 'undefined') {
+    return;
+  }
+
+  const { labels, values } = buildHistorySeries(state.historyRange);
+
+  const dataset = {
+    labels,
+    datasets: [
+      {
+        label: 'Kontostand (€)',
+        data: values,
+        borderColor: 'rgba(37, 99, 235, 0.85)',
+        backgroundColor: 'rgba(37, 99, 235, 0.18)',
+        fill: 'start',
+        tension: 0.25,
+        pointRadius: 3,
+        pointHoverRadius: 5,
+      },
+    ],
+  };
+
+  const options = {
+    responsive: true,
+    maintainAspectRatio: false,
+    scales: {
+      y: {
+        ticks: {
+          callback: (value) => formatCurrency(value),
+        },
+      },
+      x: {
+        ticks: {
+          maxRotation: 45,
+          minRotation: 0,
+        },
+      },
+    },
+    plugins: {
+      legend: {
+        display: false,
+      },
+      tooltip: {
+        callbacks: {
+          label(context) {
+            const val = context.parsed.y;
+            return formatCurrency(val);
+          },
+        },
+      },
+    },
+  };
+
+  if (!balanceChartInstance) {
+    balanceChartInstance = new window.Chart(elements.balanceChart, {
+      type: 'line',
+      data: dataset,
+      options,
+    });
+  } else {
+    balanceChartInstance.data.labels = dataset.labels;
+    balanceChartInstance.data.datasets[0].data = dataset.datasets[0].data;
+    balanceChartInstance.update();
+  }
+}
+
+function attachHistoryHandlers() {
+  if (!elements.historyButtons.length) {
+    return;
+  }
+  elements.historyButtons.forEach((button) => {
+    button.addEventListener('click', () => {
+      state.historyRange = button.dataset.historyRange || 'all';
+      updateHistoryButtons();
+      updateHistoryChart();
+    });
+  });
+  updateHistoryButtons();
+}
+
+function initFromHash() {
+  if (window.location.hash === '#auth') {
+    openModal('login');
+  }
+}
+
+function init() {
+  attachModalHandlers();
+  attachFormHandlers();
+  attachTransactionModalHandlers();
+  attachDashboardTransactionHandlers();
+  attachFilterHandlers();
+  attachNavigationHandlers();
+  attachAccountMetaHandlers();
+  attachHistoryHandlers();
+  attachAccountSettingsHandlers();
+  attachKeyUnlockHandlers();
+  if (state.signingAvailable) {
+    ensureArgon2Available().catch((error) => {
+      console.warn('Argon2 konnte nicht vorab geladen werden:', error);
+    });
+  }
+  switchAccountSettingsTab('profile');
+  syncBrandLogoSize();
+  window.addEventListener('resize', syncBrandLogoSize);
+  if (document.fonts?.ready) {
+    document.fonts.ready.then(() => {
+      syncBrandLogoSize();
+    }).catch(() => {
+      syncBrandLogoSize();
+    });
+  } else {
+    window.setTimeout(syncBrandLogoSize, 0);
+  }
+  if (typeof ResizeObserver !== 'undefined') {
+    const target = elements.topNav || elements.brandTextBlock;
+    if (target) {
+      const observer = new ResizeObserver(() => syncBrandLogoSize());
+      observer.observe(target);
+    }
+  }
+  const logoImg = elements.brandLogoWrapper?.querySelector('.brand__logo');
+  if (logoImg && !logoImg.complete) {
+    logoImg.addEventListener('load', () => {
+      syncBrandLogoSize();
+    }, { once: true });
+  }
+  updateAuthState(Boolean(state.token), state.account);
+  updateBalances();
+  updateAccountMeta();
+  updateAdvisorCard();
+  updateAutoRefreshIndicator();
+  state.transactions = [];
+  refreshTransactionList();
+
+  if (state.token) {
+    loadAccount({ silent: true });
+  }
+
+  initFromHash();
+
+  window.addEventListener('hashchange', () => {
+    if (window.location.hash === '#auth') {
+      openModal(elements.authModal?.dataset.mode || 'login');
+    }
+  });
+
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+      stopAutoRefresh();
+      if (elements.autoRefreshIndicator) {
+        elements.autoRefreshIndicator.textContent = 'Aktualisierung pausiert (Tab inaktiv)';
+      }
+      return;
+    }
+    if (state.token) {
+      loadAccount({ silent: true });
+      startAutoRefresh();
+      resetInactivityTimer();
+    }
+  });
+}
+
+init();

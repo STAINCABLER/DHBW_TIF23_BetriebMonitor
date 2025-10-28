@@ -1,0 +1,490 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AlteBank - Digitale Filiale</title>
+  <link rel="stylesheet" href="css/styles.css?v=20251024b">
+  <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
+</head>
+<body>
+  <noscript>
+    <div class="noscript">
+      <p>Für das AlteBank Web2.0 Erlebnis benötigen Sie JavaScript.</p>
+    </div>
+  </noscript>
+  <div class="app-shell">
+    <header class="top-nav">
+      <a class="brand" href="#top" aria-label="AlteBank Startseite">
+          <span class="brand__logo-wrapper">
+            <img src="assets/logo.svg" alt="AlteBank" class="brand__logo" width="48" height="48">
+          </span>
+          <div class="brand__text">
+            <span class="brand__name">AlteBank</span>
+            <span class="brand__tagline">Digitale Filiale</span>
+          </div>
+      </a>
+      <nav class="nav-links" aria-label="Hauptnavigation" id="guestNav">
+        <a href="#produkte">Produkte</a>
+        <a href="#features">Features</a>
+        <a href="#kontakt">Kontakt</a>
+      </nav>
+      <nav class="nav-links nav-links--user hidden" aria-label="Kontonavigation" id="userNav">
+        <button type="button" class="nav-link-btn" data-nav-section="overview">Übersicht</button>
+        <button type="button" class="nav-link-btn" data-nav-section="transactions">Transaktionen</button>
+        <button type="button" class="nav-link-btn" data-nav-section="history">Verlauf</button>
+        <button type="button" class="nav-link-btn" data-nav-section="contact">Kontakt</button>
+      </nav>
+      <div class="nav-actions">
+        <div id="guestActions" class="auth-actions">
+          <button class="btn btn--primary" data-open-auth="login">Anmelden</button>
+          <button class="btn btn--ghost" data-open-auth="register">Registrieren</button>
+        </div>
+        <div id="userActions" class="auth-actions auth-actions--user hidden">
+          <button class="user-pill" type="button" data-open-account-settings>
+            <span id="userInitial">A</span>
+            <span id="currentUser">Konto</span>
+          </button>
+          <button class="btn btn--ghost" data-action="logout">Abmelden</button>
+          <span id="sessionTimer" class="session-timer hidden" aria-live="polite" aria-atomic="true"></span>
+        </div>
+      </div>
+    </header>
+
+    <main>
+      <div class="landing" id="top">
+        <section class="hero">
+        <div class="hero__content">
+          <h1>Banking wie 2030 – klar, sicher, überall.</h1>
+          <p>Verwalte deine Finanzen in Echtzeit, sende Überweisungen mit einem Klick und behalte jede Bewegung im Blick. Alles im modernen AlteBank Workspace.</p>
+          <div class="hero__actions">
+            <button class="btn btn--primary" data-open-auth="register">Jetzt Konto eröffnen</button>
+            <button class="btn btn--outline" data-open-auth="login">Zum Login</button>
+          </div>
+          <div class="hero__meta">
+            <span>✅ 24/7 verfügbar</span>
+            <span>🔒 Ende-zu-Ende Verschlüsselung</span>
+          </div>
+        </div>
+        <div class="hero__preview" aria-hidden="true">
+          <div class="preview-card">
+            <p class="preview-card__label">Live-Guthaben</p>
+            <p class="preview-card__value" id="heroBalance">€ 0,00</p>
+            <div class="preview-card__rows">
+              <span class="preview-card__pill">Einzahlung</span>
+              <span class="preview-card__pill preview-card__pill--negative">Ausgang</span>
+              <span class="preview-card__pill preview-card__pill--positive">Eingang</span>
+            </div>
+            <p class="preview-card__foot">Aktualisiert in Echtzeit</p>
+          </div>
+        </div>
+        </section>
+
+        <section class="info" id="produkte">
+          <h2>Unsere Produkte</h2>
+          <div class="card-grid">
+            <article class="card">
+              <h3>Girokonto Free</h3>
+              <p>0 € Kontoführung, Instant-Push bei jeder Transaktion und digitale Kartenverwaltung.</p>
+            </article>
+            <article class="card">
+              <h3>Sparen Flex</h3>
+              <p>Flexible Sparpläne, automatische Rundung von Kartenzahlungen und Zinsübersicht.</p>
+            </article>
+            <article class="card">
+              <h3>Business Pro</h3>
+              <p>Multi-User Zugriff, Sammelüberweisungen und Export in dein Buchhaltungssystem.</p>
+            </article>
+          </div>
+        </section>
+
+        <section class="info info--accent" id="features">
+          <h2>Highlights</h2>
+          <div class="feature-grid">
+            <div class="feature">
+              <h3>Sofort-Überblick</h3>
+              <p>Egal ob Smartphone oder Desktop – dein Dashboard liefert Echtzeitdaten mit Upstash Redis.</p>
+            </div>
+            <div class="feature">
+              <h3>Smarter Cashflow</h3>
+              <p>Einzahlungen, Auszahlungen und Transfers werden klar visualisiert und historisiert.</p>
+            </div>
+            <div class="feature">
+              <h3>Sichere Sessions</h3>
+              <p>Token-basierte Sessions mit Ablaufsteuerung schützen deinen Zugang zuverlässig.</p>
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <section class="dashboard hidden" id="dashboard" aria-live="polite">
+        <div class="dashboard__sections">
+          <section class="dashboard-section" data-section="overview" id="overviewSection">
+            <header class="section-header section-header--primary">
+              <h2>Dein Konto</h2>
+              <p class="dashboard__subtitle">Alles auf einen Blick, schnell und zuverlässig.</p>
+            </header>
+            <div class="balance-card">
+              <p>Aktuelles Guthaben</p>
+              <strong id="balanceValue">€ 0,00</strong>
+            </div>
+
+            <div class="account-meta">
+              <div class="account-meta__item">
+                <span>Kontoinhaber</span>
+                <strong id="accountHolder">-</strong>
+              </div>
+              <div class="account-meta__item account-meta__item--iban">
+                <span>IBAN</span>
+                <div class="account-meta__value">
+                  <strong id="accountIban">-</strong>
+                  <button class="btn btn--link" type="button" data-action="copy-iban" disabled>Kopieren</button>
+                </div>
+              </div>
+              <div class="account-meta__item">
+                <span>E-Mail</span>
+                <strong id="accountEmail">-</strong>
+              </div>
+            </div>
+
+            <section class="transactions" aria-live="polite">
+              <div class="transactions__header">
+                <h3>Aktivitäten</h3>
+                <div class="transactions__tools">
+                  <span class="auto-refresh-hint" id="autoRefreshIndicator">Automatische Aktualisierung aktiv</span>
+                  <button class="btn btn--ghost" data-action="refresh">Aktualisieren</button>
+                  <button class="btn btn--ghost" data-action="reset-filters">Filter zurücksetzen</button>
+                </div>
+              </div>
+              <form class="transaction-filters" id="transactionFilters">
+                <div class="filter-group">
+                  <label for="filterType">Typ</label>
+                  <select id="filterType" name="type">
+                    <option value="">Alle</option>
+                    <option value="deposit">Einzahlung</option>
+                    <option value="withdraw">Auszahlung</option>
+                    <option value="transfer_in">Eingang</option>
+                    <option value="transfer_out">Ausgang</option>
+                  </select>
+                </div>
+                <div class="filter-group">
+                  <label for="filterFrom">Datum von</label>
+                  <input type="date" id="filterFrom" name="from">
+                </div>
+                <div class="filter-group">
+                  <label for="filterTo">Datum bis</label>
+                  <input type="date" id="filterTo" name="to">
+                </div>
+                <div class="filter-group">
+                  <label for="filterMin">Betrag min (€)</label>
+                  <input type="number" step="0.01" id="filterMin" name="min">
+                </div>
+                <div class="filter-group">
+                  <label for="filterMax">Betrag max (€)</label>
+                  <input type="number" step="0.01" id="filterMax" name="max">
+                </div>
+              </form>
+              <ul id="transactionList" class="transaction-list" aria-label="Letzte Transaktionen"></ul>
+            </section>
+          </section>
+
+          <section class="dashboard-section hidden" data-section="transactions" id="transactionsSection">
+            <header class="section-header">
+              <h3>Transaktionen durchführen</h3>
+              <p>Wähle die passende Aktion und erledige sie direkt in deinem Workspace.</p>
+            </header>
+            <div class="transaction-switcher" role="tablist" aria-label="Transaktionsarten">
+              <button type="button" id="transactionTabDeposit" class="transaction-switcher__btn" role="tab" data-transaction-panel-btn="deposit" aria-controls="panelDepositForm">Einzahlen</button>
+              <button type="button" id="transactionTabTransfer" class="transaction-switcher__btn" role="tab" data-transaction-panel-btn="transfer" aria-controls="panelTransferForm">Überweisen</button>
+              <button type="button" id="transactionTabWithdraw" class="transaction-switcher__btn" role="tab" data-transaction-panel-btn="withdraw" aria-controls="panelWithdrawForm">Auszahlen</button>
+            </div>
+            <div class="transaction-panels" role="presentation">
+              <form id="panelDepositForm" class="transaction-form-card hidden" role="tabpanel" aria-labelledby="transactionTabDeposit" data-transaction-panel="deposit" autocomplete="off">
+                <h4>Einzahlung</h4>
+                <p class="transaction-hint">Erhöhe dein Guthaben sofort.</p>
+                <label for="panelDepositAmount">Betrag in €</label>
+                <input type="number" id="panelDepositAmount" name="amount" min="0.01" step="0.01" required>
+                <p class="balance-preview hidden" data-preview="deposit">Neues Guthaben: <span>–</span></p>
+                <button type="submit" class="btn btn--primary btn--full">Einzahlen</button>
+              </form>
+
+              <form id="panelWithdrawForm" class="transaction-form-card hidden" role="tabpanel" aria-labelledby="transactionTabWithdraw" data-transaction-panel="withdraw" autocomplete="off">
+                <h4>Auszahlung</h4>
+                <p class="transaction-hint">Reduziert dein Guthaben – wir prüfen dein Limit automatisch.</p>
+                <label for="panelWithdrawAmount">Betrag in €</label>
+                <input type="number" id="panelWithdrawAmount" name="amount" min="0.01" step="0.01" required>
+                <p class="balance-preview hidden" data-preview="withdraw">Neues Guthaben: <span>–</span></p>
+                <button type="submit" class="btn btn--outline btn--full">Abheben</button>
+              </form>
+
+              <form id="panelTransferForm" class="transaction-form-card" role="tabpanel" aria-labelledby="transactionTabTransfer" data-transaction-panel="transfer" autocomplete="off">
+                <h4>Überweisung</h4>
+                <p class="transaction-hint">IBAN und Name müssen zusammenpassen.</p>
+                <label for="panelTransferIban">Empfänger IBAN</label>
+                <input type="text" id="panelTransferIban" name="targetIban" inputmode="text" autocomplete="off" maxlength="34" placeholder="DE00 1234 5678 9012 3456 78" required>
+                <label for="panelTransferFirst">Vorname</label>
+                <input type="text" id="panelTransferFirst" name="targetFirstName" autocomplete="given-name" minlength="2" required>
+                <label for="panelTransferLast">Nachname</label>
+                <input type="text" id="panelTransferLast" name="targetLastName" autocomplete="family-name" minlength="2" required>
+                <label for="panelTransferAmount">Betrag in €</label>
+                <input type="number" id="panelTransferAmount" name="amount" min="0.01" step="0.01" required>
+                <p class="balance-preview hidden" data-preview="transfer">Neues Guthaben: <span>–</span></p>
+                <button type="submit" class="btn btn--outline btn--full">Überweisen</button>
+              </form>
+            </div>
+          </section>
+
+          <section class="dashboard-section hidden" data-section="history" id="historySection">
+            <header class="section-header">
+              <h3>Kontoverlauf</h3>
+              <p>Visualisiere deinen Saldo über die Zeit. Filter hilft beim Fokus auf relevante Zeiträume.</p>
+            </header>
+            <div class="history-controls">
+              <button type="button" class="btn btn--ghost" data-history-range="1">24 Stunden</button>
+              <button type="button" class="btn btn--ghost" data-history-range="7">7 Tage</button>
+              <button type="button" class="btn btn--ghost" data-history-range="30">30 Tage</button>
+              <button type="button" class="btn btn--ghost" data-history-range="90">90 Tage</button>
+              <button type="button" class="btn btn--ghost" data-history-range="all">Gesamt</button>
+            </div>
+            <div class="history-chart">
+              <canvas id="balanceChart" aria-label="Kontostandsverlauf" role="img"></canvas>
+            </div>
+          </section>
+
+          <section class="dashboard-section hidden" data-section="contact" id="contactSection">
+            <header class="section-header">
+              <h3>Dein Kundenservice</h3>
+              <p>Wir begleiten dich persönlich – so erreichst du uns.</p>
+            </header>
+            <div class="contact-panel">
+              <article class="contact-card contact-card--advisor">
+                <div class="advisor-card__media">
+                  <img id="advisorPhoto" src="assets/advisors/advisor-1.svg" alt="Porträt von Sven Meyer" width="160" height="160">
+                </div>
+                <div class="advisor-card__body">
+                  <h4>Dein Ansprechpartner</h4>
+                  <p><strong id="advisorName">Sven Meyer</strong><br><span id="advisorTitle">Senior Kundenberater</span></p>
+                  <p>Direkt: <span id="advisorPhone">0711 204010</span><br>E-Mail: <a id="advisorEmail" href="mailto:sven.meyer@altebank.de">sven.meyer@altebank.de</a></p>
+                </div>
+              </article>
+              <div class="contact-panel__secondary">
+                <article class="contact-card contact-card--hours">
+                  <h4>Öffnungszeiten</h4>
+                  <p>Mo–Fr: 08:00 – 18:00 Uhr<br>Sa: 10:00 – 14:00 Uhr</p>
+                  <p>24/7 Self-Service über Chat & App</p>
+                </article>
+                <article class="contact-card contact-card--branch">
+                  <h4>Filiale Lörrach</h4>
+                  <p>Basler Straße 1<br>79539 Lörrach</p>
+                  <p>Termin nach Vereinbarung möglich.</p>
+                </article>
+              </div>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <section class="info" id="kontakt">
+        <h2>Kontakt & Support</h2>
+        <div class="contact-card">
+          <p>Basler Straße 1 · 79539 Lörrach</p>
+          <p>0711 123456 · support@altebank.de</p>
+          <p>Mo–Fr 08:00–18:00 Uhr · Chatbot jederzeit</p>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+  <p>&copy; 1899–2025 AlteBank. Mit ❤️ in Lörrach entwickelt.</p>
+      <p class="site-footer__repo">Projekt auf <a href="https://github.com/STAINCABLER/DHBW_TIF23_BetriebMonitor" target="_blank" rel="noopener">GitHub</a></p>
+      <p class="site-footer__disclaimer">Hinweis: Diese Seite ist ein Konzeptprojekt von Studierenden der DHBW. Es handelt sich nicht um ein reales Finanzangebot und es wird keine Haftung oder Verantwortung für dargestellte Inhalte oder Handlungen übernommen.</p>
+    </footer>
+  </div>
+
+  <div class="modal hidden" id="transactionModal" role="dialog" aria-modal="true" aria-labelledby="transactionTitle">
+    <div class="modal__backdrop" data-close-transaction></div>
+    <div class="modal__content modal__content--wide">
+      <button class="modal__close" data-close-transaction aria-label="Dialog schließen">&times;</button>
+      <div class="modal__header">
+        <h2 id="transactionTitle">Kontofunktionen</h2>
+        <p id="transactionSubtitle">Wähle eine Aktion, um fortzufahren.</p>
+      </div>
+      <div class="modal__body">
+        <div class="transaction-tabs" role="tablist">
+          <button class="transaction-tab is-active" data-transaction-tab="deposit" role="tab">Einzahlung</button>
+          <button class="transaction-tab" data-transaction-tab="withdraw" role="tab">Auszahlung</button>
+          <button class="transaction-tab" data-transaction-tab="transfer" role="tab">Überweisung</button>
+        </div>
+        <form id="depositForm" class="transaction-form" data-transaction-panel="deposit">
+          <p class="transaction-hint">Einzahlungen erhöhen sofort dein Guthaben.</p>
+          <label for="modalDepositAmount">Betrag in €</label>
+          <input type="number" id="modalDepositAmount" name="amount" min="0.01" step="0.01" required>
+          <button type="submit" class="btn btn--primary btn--full">Einzahlen</button>
+        </form>
+        <form id="withdrawForm" class="transaction-form hidden" data-transaction-panel="withdraw">
+          <p class="transaction-hint">Auszahlungen reduzieren dein Guthaben. Es wird geprüft, ob genug Guthaben vorhanden ist.</p>
+          <label for="modalWithdrawAmount">Betrag in €</label>
+          <input type="number" id="modalWithdrawAmount" name="amount" min="0.01" step="0.01" required>
+          <button type="submit" class="btn btn--outline btn--full">Abheben</button>
+        </form>
+        <form id="transferForm" class="transaction-form hidden" data-transaction-panel="transfer">
+          <p class="transaction-hint">Überweisungen erfolgen auf Demo-Konten über IBAN. Vor- und Nachname müssen zur IBAN passen.</p>
+          <label for="modalTransferIban">Empfänger IBAN</label>
+          <input type="text" id="modalTransferIban" name="targetIban" inputmode="text" autocomplete="off" maxlength="34" placeholder="DE00 1234 5678 9012 3456 78" required>
+          <label for="modalTransferFirst">Vorname</label>
+          <input type="text" id="modalTransferFirst" name="targetFirstName" autocomplete="given-name" minlength="2" required>
+          <label for="modalTransferLast">Nachname</label>
+          <input type="text" id="modalTransferLast" name="targetLastName" autocomplete="family-name" minlength="2" required>
+          <label for="modalTransferAmount">Betrag in €</label>
+          <input type="number" id="modalTransferAmount" name="amount" min="0.01" step="0.01" required>
+          <button type="submit" class="btn btn--outline btn--full">Überweisen</button>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal hidden" id="authModal" role="dialog" aria-modal="true" aria-labelledby="authTitle">
+    <div class="modal__backdrop" data-close-modal></div>
+    <div class="modal__content">
+      <button class="modal__close" data-close-modal aria-label="Dialog schließen">&times;</button>
+      <div class="modal__header">
+        <h2 id="authTitle">Willkommen zurück</h2>
+        <p id="authSubtitle">Melde dich an, um dein Dashboard zu öffnen.</p>
+      </div>
+      <div class="modal__body">
+        <form id="loginForm" autocomplete="on">
+          <div class="form-field">
+            <label for="loginEmail">E-Mail-Adresse</label>
+            <input type="email" id="loginEmail" name="email" autocomplete="email" required>
+          </div>
+          <div class="form-field">
+            <label for="loginPassword">Passwort</label>
+            <input type="password" id="loginPassword" name="password" minlength="6" autocomplete="current-password" required>
+          </div>
+          <button type="submit" class="btn btn--primary btn--full">Anmelden</button>
+          <p class="form-switch">Neu hier? <button type="button" class="link" data-switch-form="register">Zum Formular.</button></p>
+        </form>
+
+        <form id="registerForm" class="hidden" autocomplete="on">
+          <div class="form-field">
+            <label for="registerFirstName">Vorname</label>
+            <input type="text" id="registerFirstName" name="firstName" autocomplete="given-name" minlength="2" required>
+          </div>
+          <div class="form-field">
+            <label for="registerLastName">Nachname</label>
+            <input type="text" id="registerLastName" name="lastName" autocomplete="family-name" minlength="2" required>
+          </div>
+          <div class="form-field">
+            <label for="registerEmail">E-Mail-Adresse</label>
+            <input type="email" id="registerEmail" name="email" autocomplete="email" required>
+          </div>
+          <div class="form-field">
+            <label for="registerPassword">Passwort</label>
+            <input type="password" id="registerPassword" name="password" minlength="6" autocomplete="new-password" required>
+          </div>
+          <div class="form-field">
+            <label for="registerDeposit">Initiale Einzahlung (optional)</label>
+            <input type="number" id="registerDeposit" name="initialDeposit" min="0" step="0.01" placeholder="0.00">
+          </div>
+          <button type="submit" class="btn btn--primary btn--full">Konto anlegen</button>
+          <p class="form-switch">Schon Kunde? <button type="button" class="link" data-switch-form="login">Zurück zum Login.</button></p>
+        </form>
+      </div>
+      <div id="authFeedback" class="form-feedback" role="status" aria-live="polite"></div>
+    </div>
+  </div>
+
+    <div class="modal hidden" id="keyUnlockModal" role="dialog" aria-modal="true" aria-labelledby="keyUnlockTitle">
+      <div class="modal__backdrop" data-close-key-unlock></div>
+      <div class="modal__content">
+        <button class="modal__close" data-close-key-unlock aria-label="Dialog schließen">&times;</button>
+        <div class="modal__header">
+          <h2 id="keyUnlockTitle">Schlüssel entsperren</h2>
+          <p>Bitte gib dein Passwort ein, um deinen privaten Schlüssel zu laden und Transaktionen zu signieren.</p>
+        </div>
+        <form id="keyUnlockForm" class="modal__body" autocomplete="off">
+          <div class="form-field">
+            <label for="keyUnlockPassword">Passwort</label>
+            <input type="password" id="keyUnlockPassword" name="password" minlength="6" autocomplete="current-password" required>
+          </div>
+          <div id="keyUnlockFeedback" class="form-feedback" role="status" aria-live="polite"></div>
+          <div class="modal__actions">
+            <button type="button" class="btn btn--ghost" data-close-key-unlock>Abbrechen</button>
+            <button type="submit" class="btn btn--primary">Entsperren</button>
+          </div>
+        </form>
+      </div>
+    </div>
+
+  <div class="modal hidden" id="accountSettingsModal" role="dialog" aria-modal="true" aria-labelledby="accountSettingsTitle">
+    <div class="modal__backdrop" data-close-account-settings></div>
+    <div class="modal__content modal__content--wide">
+      <button class="modal__close" data-close-account-settings aria-label="Dialog schließen">&times;</button>
+      <div class="modal__header">
+        <h2 id="accountSettingsTitle">Kontoeinstellungen</h2>
+        <p>Aktualisiere deine persönlichen Daten oder dein Passwort.</p>
+      </div>
+      <div class="modal__body account-settings">
+        <div class="settings-tabs" role="tablist" aria-label="Kontoeinstellungen">
+          <button type="button" id="settingsTabProfile" class="settings-tab" role="tab" data-settings-tab="profile" aria-controls="profileForm">Persönliche Daten</button>
+          <button type="button" id="settingsTabPassword" class="settings-tab" role="tab" data-settings-tab="password" aria-controls="passwordForm">Passwort ändern</button>
+          <button type="button" id="settingsTabDelete" class="settings-tab" role="tab" data-settings-tab="delete" aria-controls="accountDeleteForm">Konto löschen</button>
+        </div>
+        <div class="settings-panels">
+          <form id="profileForm" class="settings-form" role="tabpanel" aria-labelledby="settingsTabProfile" data-settings-panel="profile" autocomplete="on">
+            <h3>Persönliche Daten</h3>
+            <div class="form-field">
+              <label for="settingsFirstName">Vorname</label>
+              <input type="text" id="settingsFirstName" name="firstName" minlength="2" required>
+            </div>
+            <div class="form-field">
+              <label for="settingsLastName">Nachname</label>
+              <input type="text" id="settingsLastName" name="lastName" minlength="2" required>
+            </div>
+            <div class="form-field">
+              <label for="settingsEmail">E-Mail-Adresse</label>
+              <input type="email" id="settingsEmail" name="email" required>
+            </div>
+            <button type="submit" class="btn btn--primary">Speichern</button>
+          </form>
+
+          <form id="passwordForm" class="settings-form hidden" role="tabpanel" aria-labelledby="settingsTabPassword" data-settings-panel="password" autocomplete="off">
+            <h3>Passwort ändern</h3>
+            <div class="form-field">
+              <label for="settingsCurrentPassword">Aktuelles Passwort</label>
+              <input type="password" id="settingsCurrentPassword" name="currentPassword" autocomplete="current-password" required>
+            </div>
+            <div class="form-field">
+              <label for="settingsNewPassword">Neues Passwort</label>
+              <input type="password" id="settingsNewPassword" name="newPassword" minlength="6" autocomplete="new-password" required>
+            </div>
+            <div class="form-field">
+              <label for="settingsConfirmPassword">Passwort bestätigen</label>
+              <input type="password" id="settingsConfirmPassword" name="confirmPassword" minlength="6" autocomplete="new-password" required>
+            </div>
+            <button type="submit" class="btn btn--outline">Passwort aktualisieren</button>
+          </form>
+          <form id="accountDeleteForm" class="settings-card settings-card--danger hidden" role="tabpanel" aria-labelledby="settingsTabDelete" data-settings-panel="delete" autocomplete="off">
+            <h3>Konto endgültig löschen</h3>
+            <p class="settings-card__lead">Dieser Schritt entfernt dein Konto dauerhaft, inklusive aller Transaktionen und Beraterzuordnungen. Die Aktion kann nicht rückgängig gemacht werden.</p>
+            <p class="settings-card__iban">Zur Bestätigung gib deine IBAN ein: <strong id="accountDeleteIbanHint">–</strong></p>
+            <label for="accountDeleteIban">Eigene IBAN bestätigen</label>
+            <input type="text" id="accountDeleteIban" name="confirmIban" inputmode="text" maxlength="34" placeholder="DE00 1234 5678 9012 3456 78" required>
+            <button type="submit" class="btn btn--danger">Konto löschen</button>
+          </form>
+        </div>
+      </div>
+      <div id="accountSettingsFeedback" class="form-feedback" role="status" aria-live="polite"></div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.6/dist/chart.umd.min.js" integrity="sha384-Sse/HDqcypGpyTDpvZOJNnG0TT3feGQUkF9H+mnRvic+LjR+K1NhTt8f51KIQ3v3" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/tweetnacl@1.0.3/nacl.min.js" integrity="sha384-LMUiUHpaYNGZFzWFRjsADnCSqae1Mk5llcUOHOLDhCxkyF2cdsWAueTZAzV+swW/" crossorigin="anonymous"></script>
+  <script src="/config.js"></script>
+  <script type="module" src="assets/argon2-loader.js?v=20251024b"></script>
+  <script src="assets/crypto.js?v=20251024b"></script>
+  <script type="module" src="assets/app.js?v=20251024b"></script>
+</body>
+</html>

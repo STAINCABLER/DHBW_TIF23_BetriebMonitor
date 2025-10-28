@@ -1,0 +1,17 @@
+{
+  "name": "altebank-web3-frontend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "lint": "eslint assets/**/*.js",
+    "lint:fix": "npm run lint -- --fix",
+    "test": "npm run lint"
+  },
+  "devDependencies": {
+    "eslint": "^9.11.0",
+    "eslint-config-prettier": "^9.1.0",
+    "eslint-plugin-import": "^2.30.0",
+    "globals": "^15.9.0"
+  }
+}
