@@ -24,9 +24,9 @@ from dotenv import load_dotenv
 from flask import Flask, Response, jsonify, request
 from marshmallow import Schema, ValidationError, fields, validate
 
-from api import register_apis
+from libaries.api import register_apis
 
-from crypto_utils import (
+from libaries.crypto_utils import (
     DecryptionError,
     decrypt_private_key,
     encrypt_private_key,
@@ -89,6 +89,7 @@ user_key_pepper_raw = os.getenv("USER_KEY_ENC_SECRET", "").strip()
 USER_KEY_PEPPER: Optional[bytes] = user_key_pepper_raw.encode("utf-8") if user_key_pepper_raw else None
 
 BANK_PUBLIC_KEY = os.getenv("BANK_PUBLIC_KEY", "BANK_SYSTEM").strip()
+BANK_NAME = os.getenv("BANK_NAME", "AlteBank Web3.0").strip() or "AlteBank Web3.0"
 
 _EXTERNAL_IP_LOOKUP_ENDPOINTS = [endpoint.strip() for endpoint in os.getenv(
     "EXTERNAL_IP_LOOKUP_ENDPOINTS",
@@ -400,15 +401,6 @@ def _get_advisor_by_id(advisor_id: Optional[str]) -> Dict[str, str]:
     return DEFAULT_ADVISOR
 
 
-class _KeypairRotateSchema(Schema):
-    password = fields.String(required=True, validate=validate.Length(min=6))
-    expose_private_key = fields.Boolean(load_default=False, data_key="exposePrivateKey")
-
-
-class _KeypairDeleteSchema(Schema):
-    password = fields.String(required=True, validate=validate.Length(min=6))
-
-
 class _IncomingTransactionSchema(Schema):
     transaction_id = fields.String(load_default=None, data_key="transactionId")
     type = fields.String(
@@ -423,13 +415,8 @@ class _IncomingTransactionSchema(Schema):
     metadata = fields.Dict(keys=fields.String(), values=fields.Raw(), load_default=None)
 
 
-_KEYPAIR_ROTATE_SCHEMA = _KeypairRotateSchema()
-_KEYPAIR_DELETE_SCHEMA = _KeypairDeleteSchema()
-_INCOMING_TRANSACTION_SCHEMA = _IncomingTransactionSchema()
-
-
 class _LedgerInstanceRegisterSchema(Schema):
-    instance_id = fields.String(required=True, data_key="instanceId", validate=validate.Length(min=3, max=120))
+    instance_id = fields.String(required=True, data_key="instanceId", validate=validate.Length(min=3, max=64))
     base_url = fields.String(required=True, data_key="baseUrl")
     public_key = fields.String(load_default=None, data_key="publicKey")
     token = fields.String(load_default=None)
@@ -452,6 +439,9 @@ class _LedgerHeartbeatSchema(Schema):
     metadata = fields.Dict(keys=fields.String(), values=fields.Raw(), load_default=None)
 
 
+_INCOMING_TRANSACTION_SCHEMA = _IncomingTransactionSchema()
+
+
 _LEDGER_INSTANCE_REGISTER_SCHEMA = _LedgerInstanceRegisterSchema()
 _LEDGER_INSTANCE_UPDATE_SCHEMA = _LedgerInstanceUpdateSchema()
 _LEDGER_HEARTBEAT_SCHEMA = _LedgerHeartbeatSchema()
@@ -472,6 +462,7 @@ class MemoryStore:
         self._bank_instances: Dict[str, Dict[str, Any]] = {}
         self._bank_instance_order: List[str] = []
         self._sync_state: Dict[str, Dict[str, Any]] = {}
+        self._public_key_index: Dict[str, str] = {}
 
     # Benutzerverwaltung -------------------------------------------------
     def user_exists(self, username: str) -> bool:
@@ -488,6 +479,7 @@ class MemoryStore:
             raise ValueError("E-Mail existiert bereits")
         if iban in self._iban_index:
             raise ValueError("IBAN existiert bereits")
+
         data_copy = data.copy()
         data_copy["email"] = email
         data_copy["iban"] = iban
@@ -499,6 +491,12 @@ class MemoryStore:
     def get_user(self, username: str) -> Optional[Dict[str, Any]]:
         data = self._users.get(username)
         return data.copy() if data else None
+
+    def get_user_by_public_key(self, public_key: str) -> Optional[Dict[str, Any]]:
+        username = self.resolve_username_by_public_key(public_key)
+        if not username:
+            return None
+        return self.get_user(username)
 
     def email_exists(self, email: str) -> bool:
         return email.lower() in self._email_index
@@ -554,13 +552,15 @@ class MemoryStore:
             raise KeyError("Benutzer nicht gefunden")
         user = self._users.pop(username)
         self._transactions.pop(username, None)
-        self._user_keys.pop(username, None)
+        key_entry = self._user_keys.pop(username, None)
         email = str(user.get("email") or "").strip().lower()
         iban = str(user.get("iban") or "").replace(" ", "").upper()
         if email:
             self._email_index.pop(email, None)
         if iban:
             self._iban_index.pop(iban, None)
+        if key_entry and key_entry.get("publicKey"):
+            self._public_key_index.pop(str(key_entry["publicKey"]), None)
         for token, session in list(self._sessions.items()):
             if session.get("username") == username:
                 self._sessions.pop(token, None)
@@ -626,18 +626,27 @@ class MemoryStore:
     ) -> None:
         if username not in self._users:
             raise KeyError("Benutzer nicht gefunden")
+        previous = self._user_keys.get(username)
+        if previous and previous.get("publicKey"):
+            self._public_key_index.pop(str(previous["publicKey"]), None)
         self._user_keys[username] = {
             "publicKey": public_key,
             "encryptedPrivateKey": json.loads(json.dumps(encrypted_private_key)),
             "createdAt": created_at,
         }
+        self._public_key_index[public_key] = username
 
     def get_user_key_material(self, username: str) -> Optional[Dict[str, Any]]:
         entry = self._user_keys.get(username)
         return json.loads(json.dumps(entry)) if entry else None
 
     def delete_user_key_material(self, username: str) -> None:
-        self._user_keys.pop(username, None)
+        entry = self._user_keys.pop(username, None)
+        if entry and entry.get("publicKey"):
+            self._public_key_index.pop(str(entry["publicKey"]), None)
+
+    def resolve_username_by_public_key(self, public_key: str) -> Optional[str]:
+        return self._public_key_index.get(public_key)
 
     # Ledger-Transaktionen -----------------------------------------------
     def append_ledger_transaction(self, txn: Dict[str, Any]) -> None:
@@ -748,12 +757,16 @@ class UpstashStore:
     ) -> None:
         if not self.user_exists(username):
             raise KeyError("Benutzer nicht gefunden")
+        current = self.get_user_key_material(username)
+        if current and current.get("publicKey"):
+            self._client.delete(self._public_key_key(str(current["publicKey"])))
         payload = {
             "publicKey": public_key,
             "encryptedPrivateKey": encrypted_private_key,
             "createdAt": created_at,
         }
         self._client.set(self._user_key_material_key(username), json.dumps(payload))
+        self._client.set(self._public_key_key(public_key), username)
 
     def get_user_key_material(self, username: str) -> Optional[Dict[str, Any]]:
         raw = self._client.get(self._user_key_material_key(username))
@@ -764,7 +777,10 @@ class UpstashStore:
         return json.loads(raw)
 
     def delete_user_key_material(self, username: str) -> None:
+        material = self.get_user_key_material(username)
         self._client.delete(self._user_key_material_key(username))
+        if material and material.get("publicKey"):
+            self._client.delete(self._public_key_key(str(material["publicKey"])))
 
     def user_exists(self, username: str) -> bool:
         return bool(self._client.exists(self._user_key(username)))
@@ -864,6 +880,8 @@ class UpstashStore:
             self._client.delete(self._email_key(email))
         if iban:
             self._client.delete(self._iban_key(iban))
+        if material and material.get("publicKey"):
+            self._client.delete(self._public_key_key(str(material["publicKey"])))
 
     def append_transaction(self, username: str, txn: Dict[str, Any]) -> None:
         self._client.lpush(self._txn_key(username), json.dumps(txn))
@@ -881,8 +899,17 @@ class UpstashStore:
             return None
         return self.get_user(username)
 
+    def get_user_by_public_key(self, public_key: str) -> Optional[Dict[str, Any]]:
+        username = self.resolve_username_by_public_key(public_key)
+        if not username:
+            return None
+        return self.get_user(username)
+
     def resolve_username_by_iban(self, iban: str) -> Optional[str]:
         return self._client.get(self._iban_key(iban.upper()))
+
+    def resolve_username_by_public_key(self, public_key: str) -> Optional[str]:
+        return self._client.get(self._public_key_key(public_key))
 
     def adjust_balance(self, username: str, delta: Decimal) -> Decimal:
         key = self._user_key(username)
@@ -1095,6 +1122,10 @@ class UpstashStore:
         return f"ledger:txn:{txn_id}"
 
     @staticmethod
+    def _public_key_key(public_key: str) -> str:
+        return f"public_key:{public_key}"
+
+    @staticmethod
     def _ledger_order_key() -> str:
         return "ledger:order"
 
@@ -1138,7 +1169,7 @@ def _init_store() -> Any:
 
 store = _init_store()
 
-app = Flask(__name__, static_folder=".", static_url_path="")
+app = Flask(__name__, static_folder="frontend", static_url_path="")
 app.secret_key = APP_SECRET
 
 
@@ -1190,6 +1221,7 @@ def _cancel_session_cleanup() -> None:
 
 _schedule_session_cleanup()
 atexit.register(_cancel_session_cleanup)
+
 
 def _generate_account_id() -> str:
     while True:
@@ -1306,7 +1338,10 @@ def _expand_sync_target(target: Dict[str, str]) -> List[Dict[str, str]]:
             timeout=5,
         )
         if response.status_code != 200:
-            return [target]
+                material = self.get_user_key_material(username)
+                self._client.delete(self._user_key_material_key(username))
+                if material and material.get("publicKey"):
+                    self._client.delete(self._public_key_key(str(material["publicKey"])))
         payload = response.json()
         nodes = payload.get("nodes", [])
         expanded: List[Dict[str, str]] = []
@@ -1691,9 +1726,6 @@ def _register_api_blueprints() -> None:
         require_ledger_token=_require_ledger_token,
         ledger_error_response=_ledger_error_response,
         get_configured_ledger_nodes=_get_configured_ledger_nodes,
-        ledger_instance_register_schema=_LEDGER_INSTANCE_REGISTER_SCHEMA,
-        ledger_instance_update_schema=_LEDGER_INSTANCE_UPDATE_SCHEMA,
-        ledger_heartbeat_schema=_LEDGER_HEARTBEAT_SCHEMA,
         normalize_base_url=_normalize_base_url,
         now_iso=_now_iso,
         validation_error_message=_validation_error_message,
@@ -1708,8 +1740,6 @@ def _register_api_blueprints() -> None:
         pick_random_advisor=_pick_random_advisor,
         get_advisor_by_id=_get_advisor_by_id,
         issue_user_keypair=_issue_user_keypair,
-        keypair_rotate_schema=_KEYPAIR_ROTATE_SCHEMA,
-        keypair_delete_schema=_KEYPAIR_DELETE_SCHEMA,
         persist_transaction=_persist_transaction,
         record_account_transaction=_record_account_transaction,
         format_amount=_format_amount,
@@ -1732,6 +1762,7 @@ def _register_api_blueprints() -> None:
         collect_all_ledger_transactions=_collect_all_ledger_transactions,
         paginate_ledger_transactions=_paginate_ledger_transactions,
         incoming_transaction_schema=_INCOMING_TRANSACTION_SCHEMA,
+        bank_name=BANK_NAME,
     )
     register_apis(app, ctx)
 

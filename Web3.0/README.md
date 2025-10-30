@@ -4,7 +4,8 @@ Diese Stufe legt die Grundlagen für signierte Transaktionen und den späteren F
 
 ## Voraussetzungen
 
-- Python 3.11
+- Python 3.11 (oder neuer)
+- Node.js 18.x inklusive `npm` für die SPA-Abhängigkeiten
 - OpenSSL bzw. `mkcert` zum Erzeugen lokaler TLS-Zertifikate
 - Optional: Docker zum Bauen des aktualisierten Images
 
@@ -18,18 +19,36 @@ pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-## Relevante Umgebungsvariablen
+> Hinweis: Das Projekt bringt zusätzlich ein POSIX-Skript `start.sh` mit. Unter Unix-ähnlichen Umgebungen (macOS, Linux, WSL) übernimmt es die vollständige Einrichtung:
 
-Trage die Werte in `.env` ein (Vorlage: `.env.example`).
+```bash
+./start.sh
+```
 
-| Variable | Bedeutung |
-| --- | --- |
-| `UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN` | Zugangsdaten für Upstash Redis |
-| `APP_SECRET_KEY` | Flask-Secret für Sessions |
-| `INSTANCE_ID` | Eindeutiger Bezeichner dieser Bankinstanz (z. B. `altebank-dev`) |
-| `INSTANCE_HOST` | Öffentliche URL/Hostname, den Partnerbanken verwenden |
-| `INSTANCE_TLS_DIR` | Persistentes Verzeichnis, in dem Schlüssel & Zertifikate automatisch abgelegt werden |
-| `USER_KEY_ENC_SECRET` | Optionales zusätzliches Secret für die Verschlüsselung von Nutzer-Schlüsseln |
+Das Skript legt bei Bedarf das virtuelle Environment an, installiert Python- und npm-Abhängigkeiten und startet anschließend `server.py`. Unter Windows empfiehlt sich die Ausführung in WSL oder Git Bash; in Docker-Containern wird `start.sh` automatisch als Entry Point genutzt.
+
+## Architekturüberblick
+
+- **Flask-App (`server.py`)**: Enthält Bootstrapping, Store-Verwaltung (Memory/Upstash), Authentifizierung und Hilfsfunktionen.
+- **Backend-Bibliotheken (`libaries/`)**: Beinhaltet die Blueprint-Pakete unter `libaries/api/` sowie kryptografische Utilities (`libaries/crypto_utils.py`). `register_apis` koppelt alle Blueprints an die Flask-App.
+- **Start-Workflow (`start.sh`)**: Erstellt das virtuelle Environment, installiert Python- und npm-Dependencies und übergibt anschließend an den Flask-Server. Die Dockerfile ruft dieses Skript standardmäßig über `CMD` auf.
+- **Frontend (`frontend/`)**: Single-Page-Anwendung (HTML, CSS, JS) inklusive Tests unter `frontend/assets/__tests__/`, ausgeliefert über Flask als statische Dateien.
+
+## IBAN-Generierung
+
+- Länderkennzeichen: immer `DE`.
+- Bankleitzahl: fixes Präfix `04102025` (DHBW Banking-Demo).
+- Kontonummer: zufällige, eindeutig überprüfte 10-stellige Nummer (mit führenden Nullen).
+- Prüfziffer: dynamisch berechnet über das Modulo-97-Verfahren (ISO 7064). Der Server wiederholt die Generierung, bis `store.iban_exists` kein Duplikat meldet.
+
+Damit ist jede erzeugte IBAN deterministisch aufgebaut (`DE{Prüfziffer}04102025{Kontonummer}`) und gleichzeitig eindeutig im Kontext der Demo-Bank.
+
+## Umgebungsvariablen & Konfiguration
+
+- Vorlage: `.env.example` (vollständig gruppierte Liste aller Variablen)
+- Ausführliche Beschreibung inkl. Standardwerten & erwarteten Formaten: `docs/config/environment-variables.md`
+
+Trage produktspezifische Werte in `.env` ein oder setze sie bei Deployments als echte Umgebungsvariablen.
 
 ## Nutzer-Schlüsselverwaltung
 
@@ -62,5 +81,7 @@ Die erzeugten Dateien werden in `INSTANCE_TLS_DIR` abgelegt und bei Bedarf erneu
 cd Web3.0
 docker build -t altebank-web3 .
 ```
+
+Der resultierende Container führt beim Start automatisch `bash ./start.sh` aus. Dadurch werden sämtliche Abhängigkeiten installiert, bevor `server.py` gestartet wird.
 
 Weitere Phasen (Kryptomodul, Ledger, Föderation) folgen auf dieser Basis.

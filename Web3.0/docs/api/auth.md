@@ -59,6 +59,7 @@ Erstellt ein neues Girokonto, erzeugt automatisch Schlüsselmaterial und meldet 
 - `publicKey`/`encryptedPrivateKey`: Vom System erzeugtes Schlüsselpaar; private Komponente ist mit dem angegebenen Passwort verschlüsselt.
 - `LEDGER_API_TOKEN` verbleibt serverseitig – Client-Anwendungen erhalten keinen Ledger-Token mehr über die Auth-Flows.
 - Bei `initialDeposit` > 0 wird automatisch eine signierte Einzahlung `deposit` erstellt und der Kontostand angepasst.
+- IBANs werden bei der Registrierung deterministisch im deutschen Format erzeugt: `DE{Prüfziffer}04102025{Kontonummer}`. Die Kontonummer ist eine zufällige zehnstellige Zahl, die per Modulo-97-Prüfung validiert und gegen bestehende IBANs geprüft wird.
 
 ### Fehlerantworten (Register)
 

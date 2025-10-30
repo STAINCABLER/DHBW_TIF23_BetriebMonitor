@@ -2,7 +2,7 @@ import base64
 
 import pytest
 
-from crypto_utils import (
+from libaries.crypto_utils import (
     DecryptionError,
     generate_user_keypair,
     encrypt_private_key,

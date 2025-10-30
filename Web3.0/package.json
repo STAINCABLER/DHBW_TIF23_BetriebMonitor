@@ -4,14 +4,16 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "lint": "eslint assets/**/*.js",
+    "lint": "eslint frontend/assets/**/*.js",
     "lint:fix": "npm run lint -- --fix",
-    "test": "npm run lint"
+    "test": "npm run lint && vitest run"
   },
   "devDependencies": {
     "eslint": "^9.11.0",
     "eslint-config-prettier": "^9.1.0",
     "eslint-plugin-import": "^2.30.0",
-    "globals": "^15.9.0"
+    "globals": "^15.9.0",
+    "jsdom": "^27.0.1",
+    "vitest": "^4.0.5"
   }
 }

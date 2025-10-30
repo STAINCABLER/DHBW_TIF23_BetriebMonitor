@@ -52,10 +52,11 @@ Liefert Profilinformationen, Kontostand, Transaktionshistorie und Schlüsselmate
 }
 ```
 
-- `transactions` enthält maximal 50 Einträge, jeweils das zuletzt bekannte Guthaben (`balance`) nach der Transaktion.
+- `transactions` ist absteigend nach Erstellungsdatum sortiert und enthält alle verfügbaren Einträge (neueste zuerst).
 - `advisor` wird automatisch gesetzt; falls kein Profil hinterlegt ist, weist der Server eins zu.
 - `publicKey`/`encryptedPrivateKey` stammen aus dem Schlüsselspeicher; können `null` sein, falls noch nicht generiert.
 - `bankPublicKey` enthält die serverseitige Kennung für Bank-zu-Bank-Transaktionen (z. B. `BANK_SYSTEM`).
+- Bei Überweisungen ergänzt der Server Gegenparteifelder wie `counterpartyIban`, `counterpartyName` und `counterpartyPublicKey`.
 
 ### Fehlerantworten (Account Overview)
 
@@ -216,6 +217,8 @@ Die Signatur wird über folgenden Payload erstellt:
 }
 ```
 
+Der Wert `BANK_SYSTEM` entspricht dem konfigurierten `BANK_PUBLIC_KEY` (Standard `BANK_SYSTEM`).
+
 ### Response 200 (Withdraw)
 
 ```json
@@ -333,3 +336,4 @@ Liefert Basisdaten (Name, Public Key) zu einer IBAN, um Überweisungen vorzubere
 - **Ledger-Synchronisation:** Jeder erfolgreiche Vorgang erzeugt/aktualisiert Einträge im internen Ledger (`append_ledger_transaction` bzw. `upsert_ledger_transaction`).
 - **Konfliktbehandlung:** Bei Duplikaten (z. B. wiederholtes Ledger-Append) sichert der Server die Idempotenz durch `upsert`-Fallback.
 - **Sitzungs-TTL:** Sobald das Konto gelöscht oder die Sitzung abläuft, verlieren Tokens sofort ihre Gültigkeit. Weitere Anfragen führen zu 401.
+- **IBAN-Format:** Alle vom Server erzeugten IBANs folgen dem Schema `DE{Prüfziffer}04102025{Kontonummer}`. Bei Eingaben erwartet die API eine deutsche IBAN (22 Stellen) und validiert sowohl die Prüfziffer als auch die Übereinstimmung mit den gespeicherten Bestandsdaten.

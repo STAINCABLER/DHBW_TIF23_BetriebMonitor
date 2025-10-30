@@ -170,6 +170,8 @@ Feldbeschreibung:
 
 Empfängt eingehende Transaktionen anderer Banken. Die `transactionId` in der URL muss eindeutig sein. Bei einem Konflikt (`409`) wird der Eintrag nicht überschrieben.
 
+> Hinweis: `POST /api/transactions` ohne `transactionId` liefert `405 Method Not Allowed` mit dem Hinweis, die parametrisierte Variante zu verwenden.
+
 ### Request Body
 
 ```json

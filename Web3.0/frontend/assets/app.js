@@ -2073,6 +2073,9 @@ function initFromHash() {
 }
 
 function init() {
+  if (!elements.userInitial || !elements.currentUser || !elements.dashboard) {
+    return;
+  }
   attachModalHandlers();
   attachFormHandlers();
   attachTransactionModalHandlers();
@@ -2150,3 +2153,5 @@ function init() {
 }
 
 init();
+
+export { sanitizeIban, formatIbanForDisplay, normalizeAmountInput };

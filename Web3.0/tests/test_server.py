@@ -1,8 +1,76 @@
+from collections.abc import Callable
 from decimal import Decimal
 
-from crypto_utils import decrypt_private_key, sign_message_b64
+import pytest
+
+from libaries.crypto_utils import decrypt_private_key, sign_message_b64
 
 import server
+
+
+_cleanup_callbacks: list[Callable[[], None]] = []
+
+
+@pytest.fixture(autouse=True)
+def _cleanup_registered_entries() -> None:
+    try:
+        yield
+    finally:
+        while _cleanup_callbacks:
+            callback = _cleanup_callbacks.pop()
+            try:
+                callback()
+            except Exception:
+                pass
+
+
+def _register_cleanup(callback: Callable[[], None]) -> None:
+    _cleanup_callbacks.append(callback)
+
+
+def _cleanup_user(account_id: str, token: str | None = None) -> None:
+    delete_user = getattr(server.store, "delete_user", None)
+    if callable(delete_user):
+        try:
+            delete_user(account_id)
+        except KeyError:
+            pass
+
+    delete_keys = getattr(server.store, "delete_user_key_material", None)
+    if callable(delete_keys):
+        try:
+            delete_keys(account_id)
+        except KeyError:
+            pass
+
+    if token:
+        delete_session = getattr(server.store, "delete_session", None)
+        if callable(delete_session):
+            delete_session(token)
+
+
+def _cleanup_ledger_transaction(txn_id: str) -> None:
+    delete_txn = getattr(server.store, "delete_ledger_transaction", None)
+    if callable(delete_txn):
+        delete_txn(txn_id)
+        return
+
+    storage = getattr(server.store, "_ledger_transactions", None)
+    if isinstance(storage, dict):
+        storage.pop(txn_id, None)
+
+    order = getattr(server.store, "_ledger_order", None)
+    if isinstance(order, list):
+        try:
+            order.remove(txn_id)
+        except ValueError:
+            pass
+
+
+def _cleanup_bank_instance(instance_id: str) -> None:
+    delete_instance = getattr(server.store, "delete_bank_instance", None)
+    if callable(delete_instance):
+        delete_instance(instance_id)
 
 
 server.LEDGER_API_TOKEN = "test-ledger-token"
@@ -35,6 +103,8 @@ def _register_user(client, *, email: str, first_name: str, last_name: str, initi
     assert data.get("encryptedPrivateKey")
     account_id = server.store.resolve_username_by_email(payload["email"].lower())
     assert account_id
+    token = data.get("token")
+    _register_cleanup(lambda account_id=account_id, token=token: _cleanup_user(account_id, token))
     return data, payload, account_id
 
 
@@ -315,7 +385,7 @@ def test_user_keypair_get_returns_current_material(client):
     assert material["publicKey"] == data["publicKey"]
 
 
-def test_user_keypair_rotate_creates_new_material(client):
+def test_user_keypair_rotate_is_disabled(client):
     register_response, payload, account_id = _register_user(
         client,
         email="leah@example.com",
@@ -323,22 +393,21 @@ def test_user_keypair_rotate_creates_new_material(client):
         last_name="Lang",
     )
 
+    material_before = server.store.get_user_key_material(account_id)
+
     rotate = client.post(
         "/api/user/keypair",
         headers=_auth_header(register_response["token"]),
         json={"password": payload["password"], "exposePrivateKey": True},
     )
-    assert rotate.status_code == 201
-    data = rotate.get_json()
-    assert data["publicKey"] != register_response["publicKey"]
-    assert data["previousPublicKey"] == register_response["publicKey"]
-    assert "privateKey" in data
+    assert rotate.status_code == 405
+    assert rotate.get_json()["error"] == "Schlüsselwechsel ist deaktiviert"
 
-    stored = server.store.get_user_key_material(account_id)
-    assert stored["publicKey"] == data["publicKey"]
+    material_after = server.store.get_user_key_material(account_id)
+    assert material_after == material_before
 
 
-def test_user_keypair_delete_revokes_material(client):
+def test_user_keypair_delete_is_disabled(client):
     register_response, payload, account_id = _register_user(
         client,
         email="mila@example.com",
@@ -346,16 +415,15 @@ def test_user_keypair_delete_revokes_material(client):
         last_name="Maier",
     )
 
+    material_before = server.store.get_user_key_material(account_id)
     delete_response = client.delete(
         "/api/user/keypair",
         headers=_auth_header(register_response["token"]),
         json={"password": payload["password"]},
     )
-    assert delete_response.status_code == 200
-    data = delete_response.get_json()
-    assert data["success"] is True
-    assert data["revokedPublicKey"] == register_response["publicKey"]
-    assert server.store.get_user_key_material(account_id) is None
+    assert delete_response.status_code == 405
+    assert delete_response.get_json()["error"] == "Schlüsselwiderruf ist deaktiviert"
+    assert server.store.get_user_key_material(account_id) == material_before
 
 
 def test_transactions_overview_lists_endpoints(client):
@@ -421,6 +489,7 @@ def test_transactions_receive_and_verify(client):
     assert upsert_response.status_code == 201
     payload_body = upsert_response.get_json()
     assert payload_body["transactionId"] == txn_id
+    _register_cleanup(lambda txn_id=txn_id: _cleanup_ledger_transaction(txn_id))
 
     verify_response = client.get(
         f"/api/transactions/verify/{txn_id}",
@@ -497,8 +566,9 @@ def test_transactions_export_all_returns_full_ledger(client):
         private_key=private_key,
     )
 
-    client.post(
-        "/api/transactions/txn_export_1",
+    txn_id = "txn_export_1"
+    upsert_response = client.post(
+        f"/api/transactions/{txn_id}",
         json={
             "type": "deposit",
             "amount": "20.00",
@@ -508,6 +578,8 @@ def test_transactions_export_all_returns_full_ledger(client):
             "signature": signature,
         },
     )
+    assert upsert_response.status_code == 201
+    _register_cleanup(lambda txn_id=txn_id: _cleanup_ledger_transaction(txn_id))
 
     export_response = client.get("/api/transactions/export/all")
     assert export_response.status_code == 200
@@ -516,7 +588,7 @@ def test_transactions_export_all_returns_full_ledger(client):
     assert export_payload["exportedAt"]
     transactions = export_payload["transactions"]
     ids = {entry["transactionId"] for entry in transactions}
-    assert "txn_export_1" in ids
+    assert txn_id in ids
 
 
 def test_transactions_export_stream_paginates(client):
@@ -542,7 +614,7 @@ def test_transactions_export_stream_paginates(client):
         )
         txn_id = f"txn_stream_{idx}"
         txn_ids.append(txn_id)
-        client.post(
+        upsert_response = client.post(
             f"/api/transactions/{txn_id}",
             json={
                 "type": "deposit",
@@ -553,6 +625,8 @@ def test_transactions_export_stream_paginates(client):
                 "signature": signature,
             },
         )
+        assert upsert_response.status_code == 201
+        _register_cleanup(lambda txn_id=txn_id: _cleanup_ledger_transaction(txn_id))
 
     first_page = client.get("/api/transactions/export/stream", query_string={"limit": 2})
     assert first_page.status_code == 200
@@ -574,59 +648,106 @@ def test_transactions_export_stream_paginates(client):
     assert set(txn_ids).issubset(ids)
 
 
-def test_ledger_instances_register_list_and_heartbeat(client):
+def test_user_public_data_requires_ledger_token(client):
+    register_response, _, _ = _register_user(
+        client,
+        email="public@example.com",
+        first_name="Public",
+        last_name="Lookup",
+    )
+
+    response = client.get(f"/api/user/data/{register_response['publicKey']}")
+    assert response.status_code == 401
+    payload = response.get_json()
+    assert payload["error"]
+
+
+def test_user_public_data_returns_profile(client):
+    register_response, payload, _ = _register_user(
+        client,
+        email="ledger@example.com",
+        first_name="Ledger",
+        last_name="Peer",
+    )
+
+    response = client.get(
+        f"/api/user/data/{register_response['publicKey']}",
+        headers=_ledger_header(),
+    )
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data["iban"] == register_response["iban"]
+    assert data["bankName"] == server.BANK_NAME
+    assert data["firstName"] == payload["firstName"]
+    assert data["lastName"] == payload["lastName"]
+
+
+def test_user_public_data_handles_missing_account(client):
+    response = client.get(
+        "/api/user/data/QUJDREVGRw==",
+        headers=_ledger_header(),
+    )
+    assert response.status_code == 404
+    assert response.get_json()["error"] == "Benutzer nicht gefunden"
+
+
+def test_user_public_data_validates_base64(client):
+    response = client.get(
+        "/api/user/data/invalid!!!",
+        headers=_ledger_header(),
+    )
+    assert response.status_code == 400
+    assert response.get_json()["error"] == "Öffentlicher Schlüssel ungültig"
+
+
+def test_ledger_instances_list_is_read_only(client):
     headers = _ledger_header()
-    register_response = client.post(
-        "/api/ledger/instances",
-        headers=headers,
-        json={
-            "instanceId": "bank-a",
-            "baseUrl": "https://bank-a.example",
-            "publicKey": "PUBKEY",
+    server.store.register_bank_instance(
+        "bank-auto",
+        {
+            "instanceId": "bank-auto",
+            "baseUrl": "https://bank-auto.example",
+            "status": "online",
             "metadata": {"region": "EU"},
         },
     )
-    assert register_response.status_code == 201
-    stored = register_response.get_json()
-    assert stored["instanceId"] == "bank-a"
-    assert stored["metadata"]["region"] == "EU"
+    _register_cleanup(lambda instance_id="bank-auto": _cleanup_bank_instance(instance_id))
 
     list_response = client.get("/api/ledger/instances", headers=headers)
     assert list_response.status_code == 200
     instances = list_response.get_json()["instances"]
-    assert any(item["instanceId"] == "bank-a" for item in instances)
+    assert any(item["instanceId"] == "bank-auto" for item in instances)
+
+    detail_response = client.get("/api/ledger/instances/bank-auto", headers=headers)
+    assert detail_response.status_code == 200
+    detail_payload = detail_response.get_json()
+    assert detail_payload["instanceId"] == "bank-auto"
+    assert detail_payload["status"] == "online"
+
+
+def test_ledger_instance_mutations_are_disabled(client):
+    headers = _ledger_header()
+    body = {
+        "instanceId": "bank-blocked",
+        "baseUrl": "https://bank-blocked.example",
+    }
+
+    register_response = client.post("/api/ledger/instances", headers=headers, json=body)
+    assert register_response.status_code == 405
+    assert register_response.get_json()["error"] == "Ledger-Instanzen werden automatisch verwaltet"
+
+    update_response = client.put("/api/ledger/instances/bank-blocked", headers=headers, json=body)
+    assert update_response.status_code == 405
+    assert update_response.get_json()["error"] == "Ledger-Instanzen werden automatisch verwaltet"
 
     heartbeat_response = client.post(
-        "/api/ledger/instances/bank-a/heartbeat",
+        "/api/ledger/instances/bank-blocked/heartbeat",
         headers=headers,
         json={"status": "online"},
     )
-    assert heartbeat_response.status_code == 200
-    heartbeat_payload = heartbeat_response.get_json()
-    assert heartbeat_payload["status"] == "online"
+    assert heartbeat_response.status_code == 405
+    assert heartbeat_response.get_json()["error"] == "Ledger-Instanzen werden automatisch verwaltet"
 
-    delete_response = client.delete("/api/ledger/instances/bank-a", headers=headers)
-    assert delete_response.status_code == 200
-    assert delete_response.get_json()["success"] is True
-
-
-def test_ledger_instances_put_creates_and_updates(client):
-    headers = _ledger_header()
-    create_response = client.put(
-        "/api/ledger/instances/bank-b",
-        headers=headers,
-        json={"baseUrl": "bank-b.example", "status": "init"},
-    )
-    assert create_response.status_code == 201
-    created_payload = create_response.get_json()
-    assert created_payload["baseUrl"] == "https://bank-b.example"
-
-    update_response = client.put(
-        "/api/ledger/instances/bank-b",
-        headers=headers,
-        json={"metadata": {"clusters": 2}, "status": "active"},
-    )
-    assert update_response.status_code == 200
-    updated_payload = update_response.get_json()
-    assert updated_payload["metadata"]["clusters"] == 2
-    assert updated_payload["status"] == "active"
+    delete_response = client.delete("/api/ledger/instances/bank-blocked", headers=headers)
+    assert delete_response.status_code == 405
+    assert delete_response.get_json()["error"] == "Ledger-Instanzen werden automatisch verwaltet"

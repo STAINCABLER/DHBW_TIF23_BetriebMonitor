@@ -4,11 +4,11 @@ import globals from 'globals';
 
 export default [
   {
-    ignores: ['assets/vendor/**', 'node_modules/**'],
+  ignores: ['frontend/assets/vendor/**', 'node_modules/**'],
   },
   js.configs.recommended,
   {
-    files: ['assets/**/*.js'],
+  files: ['frontend/assets/**/*.js'],
     languageOptions: {
       ecmaVersion: 'latest',
       sourceType: 'module',

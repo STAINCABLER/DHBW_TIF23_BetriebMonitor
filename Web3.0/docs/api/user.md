@@ -1,10 +1,11 @@
 # Benutzer-Schlüsselmaterial-API (Web3.0)
 
-Die Endpunkte unter `/api/user/keypair` ermöglichen es angemeldeten Personen, ihr kryptografisches Schlüsselmaterial einzusehen, zu rotieren oder zu widerrufen. Alle Aufrufe benötigen ein gültiges Bearer-Token im Header (`Authorization: Bearer <token>`).
+Die Endpunkte unter `/api/user/keypair` erlauben angemeldeten Personen, ihr kryptografisches Schlüsselmaterial einzusehen. Rotation und Widerruf sind derzeit deaktiviert und liefern HTTP 405. Zusätzlich stellt `/api/user/data/{publicKey}` einen lesenden Lookup-Endpunkt für Föderationspartner bereit.
 
-- **Passwortprüfung:** Für Mutationen (`POST`, `DELETE`) muss das aktuelle Login-Passwort übermittelt werden.
-- **Schlüsselmaterial:** Der private Schlüssel wird serverseitig ausschließlich verschlüsselt gespeichert (AES-GCM, optional Pepper über `USER_KEY_ENC_SECRET`).
-- **Antwortformat:** Erfolgreiche Antworten liefern strukturierte JSON-Objekte, Fehler folgen `{ "error": "Fehlermeldung" }`.
+- **Authentifizierung (Keypair):** Bearer-Token über `Authorization: Bearer <token>` erforderlich.
+- **Ledger-Zugriff:** Für `/api/user/data/{publicKey}` muss ein gültiges Ledger-Token (`X-Ledger-Token`) vorliegen.
+- **Schlüsselmaterial:** Der private Schlüssel wird verschlüsselt gespeichert (AES-GCM, optional Pepper via `USER_KEY_ENC_SECRET`).
+- **Antwortformat:** Erfolgreiche Antworten liefern JSON-Objekte; Fehler folgen `{ "error": "Fehlermeldung" }`.
 
 ## GET `/api/user/keypair`
 
@@ -33,80 +34,38 @@ Gibt das aktuell gespeicherte Schlüsselmaterial zurück.
 
 ## POST `/api/user/keypair`
 
-Erzeugt ein neues Schlüsselpaar und ersetzt das bestehende.
-
-### Request-JSON (Keypair Rotate)
-
-```json
-{
-  "password": "Secret123",
-  "exposePrivateKey": false
-}
-```
-
-| Feld | Pflicht | Beschreibung |
-| --- | --- | --- |
-| `password` | ja | Aktuelles Login-Passwort; wird zur Authentifizierung und für die Verschlüsselung genutzt. |
-| `exposePrivateKey` | optional | Wenn `true`, liefert die Antwort den neuen Private Key (Base64-kodiert) für Testzwecke. Standard `false`. |
-
-### Response 201 (Keypair Rotate)
-
-```json
-{
-  "publicKey": "B64==",
-  "createdAt": "2024-05-04T12:05:00+00:00",
-  "encryptedPrivateKey": {
-    "ciphertext": "...",
-    "nonce": "...",
-    "tag": "..."
-  },
-  "previousPublicKey": "B64==",
-  "privateKey": "BASE64-OPTIONAL"
-}
-```
-
-- `previousPublicKey` zeigt den zuvor aktiven Schlüssel an.
-- Das Feld `privateKey` ist nur enthalten, wenn `exposePrivateKey = true` übermittelt wurde.
-
-### Fehlerantworten (Keypair Rotate)
-
-| Status | Grund |
-| --- | --- |
-| 400 | Passwort ist falsch oder Pflichtfelder fehlen. |
-| 401 | Token fehlt oder ist ungültig. |
-| 404 | Konto nicht gefunden. |
+Der Schlüsselwechsel ist deaktiviert. Der Server antwortet mit HTTP 405 und der Fehlermeldung `"Schlüsselwechsel ist deaktiviert"`.
 
 ## DELETE `/api/user/keypair`
 
-Hebt das gespeicherte Schlüsselmaterial auf. Beim nächsten Login wird ein neues Paar erzeugt.
+Der Widerruf ist deaktiviert. Der Server antwortet mit HTTP 405 und der Fehlermeldung `"Schlüsselwiderruf ist deaktiviert"`.
 
-### Request-JSON (Keypair Delete)
+## GET `/api/user/data/{publicKey}`
 
-```json
-{
-  "password": "Secret123"
-}
-```
+Stellt Grunddaten (IBAN, Vorname, Nachname, Bankname) zu einem Konto bereit. Der Endpunkt ist für föderierte Partnerbanken gedacht und erfordert ein gültiges Ledger-Token (`X-Ledger-Token`). Der Public Key muss Base64-kodiert übergeben werden.
 
-### Response 200 (Keypair Delete)
+### Response 200 (Public User Data)
 
 ```json
 {
-  "success": true,
-  "revokedPublicKey": "B64=="
+  "iban": "DE89...",
+  "bankName": "AlteBank Web3.0",
+  "firstName": "Max",
+  "lastName": "Mustermann"
 }
 ```
 
-### Fehlerantworten (Keypair Delete)
+### Fehlerantworten (Public User Data)
 
 | Status | Grund |
 | --- | --- |
-| 400 | Passwort ist falsch. |
-| 401 | Token fehlt oder ist ungültig. |
-| 404 | Konto oder Schlüsselmaterial nicht vorhanden. |
+| 400 | Public Key fehlt oder ist ungültig kodiert. |
+| 401 | Ledger-Token fehlt oder ist ungültig. |
+| 404 | Kein Konto zum Public Key gefunden. |
+| 503 | Der verwendete Store unterstützt den Lookup nicht. |
 
 ## Sicherheit & Hinweise
 
-- **Passwortvalidierung:** Alle mutierenden Aufrufe validieren das aktuelle Passwort über `_verify_password`.
-- **Audit Trail:** Der Server speichert lediglich das neue Schlüsselmaterial; eventuelle Historisierung muss clientseitig erfolgen.
-- **Privatschlüssel:** Die Rückgabe des privaten Schlüssels dient ausschließlich Testzwecken – in Produktionskontexten sollte `exposePrivateKey` deaktiviert bleiben.
+- **Token-Handling:** Für `/api/user/keypair` ist ein gültiges Bearer-Token nötig, für `/api/user/data/{publicKey}` ein Ledger-Token.
+- **Audit Trail:** Der Server speichert lediglich das Schlüsselmaterial; Historisierung liegt beim Client.
+- **Privatschlüssel:** Verlassen niemals den Server; Föderationspartner erhalten ausschließlich Metadaten.
