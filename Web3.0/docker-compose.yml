@@ -1,7 +1,7 @@
 ---
 services:
   web:
-    image: ghcr.io/staincabler/dhbw_tif23_betriebmonitor-web2.0:latest
+    image: ghcr.io/staincabler/dhbw_tif23_betriebmonitor-web3.0:latest
     restart: unless-stopped
     env_file:
       - .env

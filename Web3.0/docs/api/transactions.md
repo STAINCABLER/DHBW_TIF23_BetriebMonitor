@@ -1,175 +1,274 @@
-# Admin-Transaktions-API (Web3.0)
+# Transactions API
 
-Die folgenden Endpunkte dienen Administrations- und Testzwecken. Sie erlauben den Zugriff auf das globale Ledger sowie das manuelle Einspeisen von Transaktionen.
+Die Transaktions-API stellt alle öffentlich erreichbaren Endpunkte bereit, um das Ledger der Bank zu inspizieren, neue eingehende Zahlungen anderer Institute zu erfassen und vorhandene Einträge zu verifizieren. Sämtliche Endpunkte sind derzeit ohne Token nutzbar. Zukünftige Versionen können Authentifizierung ergänzen; Clients sollten entsprechende Erweiterungen berücksichtigen.
 
-- **Basis-URL:** `/api/transactions`
-- **Authentifizierung:** Erfordert den Header `X-Ledger-Token`. Der Wert muss exakt dem serverseitig konfigurierten `LEDGER_API_TOKEN` entsprechen. Ohne diesen Token sind die Endpunkte deaktiviert.
-- **Antwortformat:** Erfolgsantworten liefern strukturierte JSON-Objekte, Fehler antworten mit `{ "error": "Fehlermeldung" }`.
-- **Signaturen:** Alle Einträge im Ledger sollten eine gültige Ed25519-Signatur enthalten. Die Endpunkte unterstützen Signaturprüfung und Diagnosefunktionen.
+Alle Beträge werden als String mit zwei Nachkommastellen im Dezimalformat (`"123.45"`) übertragen. Zeitstempel folgen ISO-8601 (`YYYY-MM-DDTHH:MM:SS.sssZ`). Signaturen nutzen das im Benutzerkonto hinterlegte Schlüsselpaar und werden Base64-kodiert.
+
+---
 
 ## GET `/api/transactions`
 
-Listet Ledger-Einträge paginiert auf. Optional können Ergebnisse auf eine Gegenpartei gefiltert werden.
+Liefert eine generierte Übersicht über die verfügbaren Transaktions-Endpunkte dieser Instanz. Dieser Einstiegspunkt eignet sich für Service-Discovery sowie für Monitoring-Tools.
 
-### Query-Parameter
-
-| Parameter | Typ | Beschreibung |
-| --- | --- | --- |
-| `limit` | integer | Anzahl der maximal zurückzugebenden Einträge (1–500, Standard 100). |
-| `sinceId` | string | Liefert Einträge nach der angegebenen Transaktions-ID. Dient als Cursor für nachfolgende Seiten. |
-| `partner` | string | Filtert auf Transaktionen, deren Sender*in oder Empfänger*in diesen Public Key besitzt. |
-
-### Response 200 (Ledger List)
+### Beispielantwort (Transaktionsübersicht)
 
 ```json
 {
-  "transactions": [
-    {
-      "transactionId": "txn_...",
-      "type": "deposit",
-      "amount": "150.00",
-      "senderPublicKey": "B64==",
-      "receiverPublicKey": "B64==",
-      "signature": "B64==",
-      "timestamp": "2024-05-04T12:00:00+00:00",
-      "metadata": {
-        "source": "manual"
-      }
-    }
-  ],
-  "nextSinceId": "txn_..."
+    "generatedAt": "2025-10-28T12:00:00.123456+00:00",
+    "endpoints": [
+        {
+            "method": "GET",
+            "path": "/api/transactions",
+            "url": "https://bank.example/api/transactions",
+            "description": "Listet sämtliche verfügbaren Transaktions-Endpunkte dieser Instanz auf."
+        },
+        {
+            "method": "GET",
+            "path": "/api/transactions/export",
+            "url": "https://bank.example/api/transactions/export",
+            "description": "Listet verfügbare Export-Varianten (vollständig vs. paginiert)."
+        },
+        {
+            "method": "POST",
+            "path": "/api/transactions/{transactionId}",
+            "url": "https://bank.example/api/transactions/{transactionId}",
+            "description": "Empfängt eingehende Transaktionen anderer Institute und legt sie im Ledger ab."
+        },
+        {
+            "method": "GET",
+            "path": "/api/transactions/verify/{transactionId}",
+            "url": "https://bank.example/api/transactions/verify/{transactionId}",
+            "description": "Prüft eine vorhandene Ledger-Transaktion auf Gültigkeit der Signatur."
+        }
+    ]
 }
 ```
 
-- `nextSinceId` wird nur gesetzt, wenn exakt `limit` Einträge geliefert wurden.
+Feldbeschreibung:
 
-### Fehlerantworten (Ledger List)
+- `generatedAt`: Zeitpunkt der Generierung der Übersicht (UTC).
+- `endpoints`: Liste der Endpunkt-Metadaten.
 
-| Status | Grund |
-| --- | --- |
-| 401 | `X-Ledger-Token` fehlt oder stimmt nicht mit `LEDGER_API_TOKEN` überein. |
-| 503 | Ledger-API ist deaktiviert (kein `LEDGER_API_TOKEN` gesetzt). |
+---
 
 ## GET `/api/transactions/export`
 
-Gibt das vollständige Ledger als Liste zurück. Interne Paginierung wird serverseitig abgehandelt; Client-Anfragen benötigen keine zusätzlichen Parameter.
+Discovery-Endpunkt, der alle Exportvarianten auflistet. Ideal für Clients, die dynamisch entscheiden möchten, ob sie einen kompletten Dump oder die paginierte Variante beziehen.
 
-### Response 200 (Ledger Export)
+### Beispielantwort (Export-Discovery)
 
 ```json
 {
-  "transactions": [
-    {
-      "transactionId": "txn_...",
-      "type": "deposit",
-      "amount": "150.00",
-      "senderPublicKey": "B64==",
-      "receiverPublicKey": "B64==",
-      "signature": "B64==",
-      "timestamp": "2024-05-04T12:00:00+00:00"
+    "generatedAt": "2025-10-28T12:10:00.000000+00:00",
+    "exports": [
+        {
+            "path": "/api/transactions/export/all",
+            "url": "https://bank.example/api/transactions/export/all",
+            "description": "Gibt das vollständige Ledger als einmaligen JSON-Dump zurück."
+        },
+        {
+            "path": "/api/transactions/export/stream",
+            "url": "https://bank.example/api/transactions/export/stream",
+            "description": "Liefert das Ledger paginiert (Parameter: limit, sinceId)."
+        }
+    ]
+}
+```
+
+Feldbeschreibung:
+
+- `generatedAt`: Zeitpunkt der Generierung (UTC).
+- `exports`: Liste der Export-Varianten mit Pfad, absoluter URL und Beschreibung.
+
+---
+
+## GET `/api/transactions/export/all`
+
+Gibt das komplette Ledger als JSON zurück – identisch zum früheren Verhalten des Export-Endpunkts. Nicht paginiert, daher bei sehr großen Datenmengen entsprechend ressourcenintensiv.
+
+### Beispielantwort (Vollständiger Export)
+
+```json
+{
+    "exportedAt": "2025-10-28T12:00:05.654321+00:00",
+    "count": 120,
+    "transactions": [
+        {
+            "transactionId": "txn_abc123",
+            "type": "deposit",
+            "amount": "42.00",
+            "senderPublicKey": "BASE64==",
+            "receiverPublicKey": "BASE64==",
+            "signature": "BASE64SIG==",
+            "timestamp": "2025-10-01T09:12:34+00:00",
+            "metadata": {
+                "source": "external-ledger"
+            }
+        }
+    ]
+}
+```
+
+Feldbeschreibung:
+
+- `exportedAt`: Zeitpunkt der Exporteerstellung (UTC).
+- `count`: Anzahl der gelieferten Ledger-Einträge.
+- `transactions`: Liste der Transaktionen in Einfüge-Reihenfolge.
+
+---
+
+## GET `/api/transactions/export/stream`
+
+Paginiert das Ledger. Unterstützt zwei Query-Parameter:
+
+- `limit` (optional, Standard `200`, Bereich `1..500`)
+- `sinceId` (optional, letzte bekannte `transactionId`, ab der weitergelesen werden soll)
+
+### Beispielantwort (Paginierter Export)
+
+```json
+{
+    "exportedAt": "2025-10-28T12:05:00.000000+00:00",
+    "limit": 2,
+    "sinceId": "txn_abc120",
+    "nextSinceId": "txn_abc122",
+    "count": 2,
+    "transactions": [
+        {
+            "transactionId": "txn_abc121",
+            "type": "deposit",
+            "amount": "12.00",
+            "senderPublicKey": "BASE64==",
+            "receiverPublicKey": "BASE64==",
+            "signature": "BASE64SIG==",
+            "timestamp": "2025-10-02T08:00:00+00:00"
+        },
+        {
+            "transactionId": "txn_abc122",
+            "type": "withdraw",
+            "amount": "5.00",
+            "senderPublicKey": "BASE64==",
+            "receiverPublicKey": "BASE64==",
+            "signature": "BASE64SIG==",
+            "timestamp": "2025-10-02T08:05:00+00:00"
+        }
+    ]
+}
+```
+
+Feldbeschreibung:
+
+- `limit`: Genutzter Limitwert für diese Seite.
+- `sinceId`: Startpunkt der Abfrage (kann `null` sein).
+- `nextSinceId`: Cursor für die nächste Seite (`null`, wenn keine weiteren Daten verfügbar sind).
+- `count`: Anzahl der gelieferten Elemente auf dieser Seite.
+- `transactions`: Ergebnis-Liste.
+
+---
+
+## POST `/api/transactions/{transactionId}`
+
+Empfängt eingehende Transaktionen anderer Banken. Die `transactionId` in der URL muss eindeutig sein. Bei einem Konflikt (`409`) wird der Eintrag nicht überschrieben.
+
+### Request Body
+
+```json
+{
+    "transactionId": "txn_partner_001",  // optional, muss mit der URL übereinstimmen
+    "type": "deposit",                    // "deposit" | "withdraw" | "transfer" | "custom"
+    "amount": "100.00",                  // positiver Betrag als String
+    "timestamp": "2025-10-28T11:58:02Z",
+    "senderPublicKey": "BASE64PUB==",
+    "receiverPublicKey": "BASE64PUB==",
+    "signature": "BASE64SIG==",
+    "metadata": {                         // optional, frei definierbar
+        "partnerInstance": "bank-a"
     }
-  ]
 }
 ```
 
-### Fehlerantworten (Ledger Export)
+### Validierung
 
-| Status | Grund |
-| --- | --- |
-| 401 | `X-Ledger-Token` fehlt oder ist ungültig. |
-| 503 | Ledger-API ist deaktiviert. |
+- `transactionId`: optional im Body, muss – falls vorhanden – exakt der URL entsprechen.
+- `type`: einer der vier unterstützten Typen.
+- `amount`: größer als `0`, zwei Nachkommastellen empfohlen.
+- `signature`: wird gegen den rekonstruierten Nachrichten-Hash verifiziert (`type`, `sender`, `receiver`, `amount`, `timestamp`).
+- `metadata`: freies Objekt, wird unverändert persistiert.
 
-## PUT `/api/transactions/{transactionId}`
+### Antworten (POST /api/transactions/{transactionId})
 
-Legt einen Ledger-Eintrag mit der angegebenen ID an oder aktualisiert ihn. Bei bestehenden Einträgen muss `allowUpdate = true` gesetzt werden, sonst antwortet der Server mit `409 Konflikt`.
-
-### Request-JSON (Ledger Upsert)
+- `201 Created`: Transaktion wurde gespeichert. Antwort enthält den persistierten Ledger-Eintrag.
 
 ```json
 {
-  "type": "deposit",
-  "amount": "150.00",
-  "timestamp": "2024-05-04T12:00:00+00:00",
-  "senderPublicKey": "B64==",
-  "receiverPublicKey": "B64==",
-  "signature": "B64==",
-  "metadata": {
-    "source": "manual"
-  },
-  "allowUpdate": false,
-  "skipSignatureCheck": false
+    "transactionId": "txn_partner_001",
+    "ledgerEntry": {
+        "transactionId": "txn_partner_001",
+        "type": "deposit",
+        "amount": "100.00",
+        "senderPublicKey": "BASE64PUB==",
+        "receiverPublicKey": "BASE64PUB==",
+        "signature": "BASE64SIG==",
+        "timestamp": "2025-10-28T11:58:02Z",
+        "metadata": {
+            "partnerInstance": "bank-a"
+        }
+    },
+    "storedAt": "2025-10-28T12:00:06.789012+00:00"
 }
 ```
 
-### Response 201/200 (Ledger Upsert)
+- `400 Bad Request`: Eingabedaten fehlerhaft oder Signatur ungültig (z. B. `"Signatur ungültig"`, `"timestamp darf nicht leer sein"`).
+- `409 Conflict`: Transaktion existiert bereits.
 
-```json
-{
-  "transactionId": "txn_123",
-  "ledgerEntry": {
-    "transactionId": "txn_123",
-    "type": "deposit",
-    "amount": "150.00",
-    "senderPublicKey": "B64==",
-    "receiverPublicKey": "B64==",
-    "signature": "B64==",
-    "timestamp": "2024-05-04T12:00:00+00:00",
-    "metadata": {
-      "source": "manual"
-    }
-  }
-}
-```
-
-- Status `201` signalisiert einen neuen Eintrag, `200` eine erfolgreiche Aktualisierung.
-- `skipSignatureCheck` sollte nur für Testfälle genutzt werden; ohne diese Option wird die Signatur verifiziert.
-
-### Fehlerantworten (Ledger Upsert)
-
-| Status | Grund |
-| --- | --- |
-| 400 | Ungültige Eingaben oder Signatur fehlgeschlagen. |
-| 401 | `X-Ledger-Token` fehlt oder ist ungültig. |
-| 409 | Transaktion existiert bereits und `allowUpdate` ist `false`. |
-| 503 | Ledger-API ist deaktiviert. |
-
-> **Hinweis:** POST-Anfragen auf `/api/transactions` werden mit HTTP 405 beantwortet (`"Ledger-Schreiboperationen nutzen PUT /api/transactions/{transactionId}"`).
+---
 
 ## GET `/api/transactions/verify/{transactionId}`
 
-Prüft die Signatur eines Ledger-Eintrags und liefert das Ergebnis.
+Prüft einen vorhandenen Ledger-Eintrag. Die Signatur wird anhand derselben Regeln wie bei der Annahme quelloffen validiert.
 
-### Response 200 (Ledger Verify)
+### Antworten (GET /api/transactions/verify/{transactionId})
+
+- `200 OK`: Eintrag gefunden.
 
 ```json
 {
-  "transactionId": "txn_...",
-  "verified": true,
-  "ledgerEntry": {
-    "transactionId": "txn_...",
-    "type": "deposit",
-    "amount": "150.00",
-    "senderPublicKey": "B64==",
-    "receiverPublicKey": "B64==",
-    "signature": "B64==",
-    "timestamp": "2024-05-04T12:00:00+00:00"
-  }
+    "transactionId": "txn_partner_001",
+    "verified": true,
+    "verifiedAt": "2025-10-28T12:00:07.000000+00:00",
+    "ledgerEntry": {
+        "transactionId": "txn_partner_001",
+        "type": "deposit",
+        "amount": "100.00",
+        "senderPublicKey": "BASE64PUB==",
+        "receiverPublicKey": "BASE64PUB==",
+        "signature": "BASE64SIG==",
+        "timestamp": "2025-10-28T11:58:02Z"
+    }
 }
 ```
 
-Bei ungültiger Signatur enthält die Antwort zusätzlich `"reason": "Signatur ungültig"`. Wenn Pflichtfelder fehlen, wird `verified = false` mit einer entsprechenden Begründung zurückgegeben.
+Bei fehlenden Pflichtfeldern wird `verified` auf `false` gesetzt und `reason` erläutert.
 
-### Fehlerantworten (Ledger Verify)
+- `404 Not Found`: Eintrag existiert nicht.
+- `503 Service Unavailable`: Ledger-Speicher nicht verfügbar (nur bei Speicherfehlern).
 
-| Status | Grund |
-| --- | --- |
-| 401 | `X-Ledger-Token` fehlt oder ist ungültig. |
-| 404 | Transaktion nicht vorhanden. |
-| 503 | Ledger-Storage nicht verfügbar oder Ledger-API deaktiviert. |
+---
 
-## Betriebs- und Sicherheitshinweise
+## Fehlerbehandlung
 
-- **Token-Handling:** Bewahre das konfigurierte `LEDGER_API_TOKEN` geheim. Ist kein Token hinterlegt, antworten die Endpunkte mit 503 und sind faktisch deaktiviert.
-- **Signaturvalidierung:** Für verlässliche Ergebnisse sollten Tests `skipSignatureCheck = false` setzen. Nur für Negativtests darf die Prüfung übersprungen werden.
-- **Ledger-Auswirkungen:** Ledger-Upserts erfassen nur Transaktionen im globalen Journal. Konto- oder Nutzerstände werden dadurch nicht automatisch angepasst.
-- **Paginierung:** Nutze `nextSinceId`, um Folgeseiten abzurufen (`?sinceId=<value>`).
+Alle Fehlerantworten folgen dem Schema `{ "error": "Nachricht" }`. Nachrichten bleiben deutschsprachig.
+
+Clients sollten insbesondere folgende Fehlermeldungen beachten:
+
+- `"Signatur ungültig"`: kryptografische Prüfung fehlgeschlagen.
+- `"Transaktion existiert bereits"`: `transactionId` bereits vergeben.
+- `"timestamp darf nicht leer sein"`: Feld zwar vorhanden, aber leer.
+- `"Ledger-Speicher nicht verfügbar"`: interner Persistenzlayer nicht erreichbar.
+
+---
+
+## Änderungsschronik
+
+- `2025-10-28`: Endpunkte neu definiert – Authentifizierung entfällt vorerst; neue Discovery- und Export-Antworten; Signaturprüfung obligatorisch.
+- `2025-10-29`: Export-Endpunkt in Übersicht, vollständigen Dump und paginierte Ausgabe aufgeteilt.

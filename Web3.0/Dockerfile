@@ -13,18 +13,17 @@ WORKDIR /app
 # ---- Abhängigkeiten ----
 # hadolint ignore=DL3008
 RUN apt-get update \
-	&& apt-get install -y --no-install-recommends build-essential libffi-dev \
+	&& apt-get install -y --no-install-recommends build-essential libffi-dev nodejs npm \
 	&& rm -rf /var/lib/apt/lists/*
-
-# ---- Python-Abhängigkeiten ----
-COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
 
 # ---- Anwendung kopieren ----
 COPY . /app
+
+# ---- Start-Skript vorbereiten ----
+RUN chmod +x /app/start.sh
 
 # ---- Port freigeben ----
 EXPOSE 8000
 
 # ---- Startbefehl ----
-CMD ["python", "server.py"]
+CMD ["bash", "./start.sh"]

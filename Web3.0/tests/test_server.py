@@ -358,46 +358,32 @@ def test_user_keypair_delete_revokes_material(client):
     assert server.store.get_user_key_material(account_id) is None
 
 
-def test_admin_transactions_list_filters_by_partner(client):
-    register_response, payload, account_id = _register_user(
-        client,
-        email="nina@example.com",
-        first_name="Nina",
-        last_name="Neu",
-        initial="100",
-    )
+def test_transactions_overview_lists_endpoints(client):
+    response = client.get("/api/transactions")
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert "generatedAt" in payload
+    endpoints = {item["path"]: item for item in payload["endpoints"]}
+    assert "/api/transactions" in endpoints
+    assert "/api/transactions/export" in endpoints
+    assert endpoints["/api/transactions/export"]["description"]
+    assert "/api/transactions/{transactionId}" in endpoints
+    assert "/api/transactions/verify/{transactionId}" in endpoints
 
-    private_key = _get_private_key(account_id, payload["password"])
-    timestamp = server._now_iso()
-    signature = _sign_transaction(
-        txn_type="deposit",
-        sender_public_key=register_response["publicKey"],
-        receiver_public_key=register_response["publicKey"],
-        amount="25.00",
-        timestamp=timestamp,
-        private_key=private_key,
-    )
 
-    client.post(
-        "/api/accounts/deposit",
-        headers=_auth_header(register_response["token"]),
-        json={"amount": "25", "timestamp": timestamp, "signature": signature},
-    )
+def test_transactions_export_overview_lists_variants(client):
+    response = client.get("/api/transactions/export")
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["generatedAt"]
+    exports = {entry["path"]: entry for entry in payload["exports"]}
+    assert "/api/transactions/export/all" in exports
+    assert "/api/transactions/export/stream" in exports
+    assert exports["/api/transactions/export/all"]["description"]
+    assert exports["/api/transactions/export/stream"]["description"]
 
-    list_response = client.get(
-        "/api/transactions",
-        headers=_ledger_header(),
-        query_string={"limit": 5, "partner": register_response["publicKey"]},
-    )
-    assert list_response.status_code == 200
-    entries = list_response.get_json()["transactions"]
-    assert entries
-    assert all(
-        entry["senderPublicKey"] == register_response["publicKey"]
-        or entry["receiverPublicKey"] == register_response["publicKey"]
-        for entry in entries
-    )
-def test_ledger_transactions_put_and_verify(client):
+
+def test_transactions_receive_and_verify(client):
     register_response, payload, _ = _register_user(
         client,
         email="oliver@example.com",
@@ -420,9 +406,8 @@ def test_ledger_transactions_put_and_verify(client):
     )
 
     txn_id = "txn_manual_1"
-    upsert_response = client.put(
+    upsert_response = client.post(
         f"/api/transactions/{txn_id}",
-        headers=_ledger_header(),
         json={
             "type": "deposit",
             "amount": amount_str,
@@ -439,7 +424,6 @@ def test_ledger_transactions_put_and_verify(client):
 
     verify_response = client.get(
         f"/api/transactions/verify/{txn_id}",
-        headers=_ledger_header(),
     )
     assert verify_response.status_code == 200
     verify_data = verify_response.get_json()
@@ -447,7 +431,7 @@ def test_ledger_transactions_put_and_verify(client):
     assert verify_data["ledgerEntry"]["metadata"]["source"] == "manual"
 
 
-def test_admin_transaction_verify_reports_invalid_signature(client):
+def test_transactions_receive_rejects_invalid_signature(client):
     register_response, payload, _ = _register_user(
         client,
         email="pia@example.com",
@@ -457,9 +441,8 @@ def test_admin_transaction_verify_reports_invalid_signature(client):
 
     timestamp = server._now_iso()
     txn_id = "txn_manual_invalid"
-    upsert_response = client.put(
+    upsert_response = client.post(
         f"/api/transactions/{txn_id}",
-        headers=_ledger_header(),
         json={
             "type": "deposit",
             "amount": "5.00",
@@ -467,28 +450,34 @@ def test_admin_transaction_verify_reports_invalid_signature(client):
             "senderPublicKey": register_response["publicKey"],
             "receiverPublicKey": register_response["publicKey"],
             "signature": "invalid",
-            "skipSignatureCheck": True,
         },
     )
-    assert upsert_response.status_code == 201
+    assert upsert_response.status_code == 400
+    assert upsert_response.get_json()["error"] == "Signatur ungültig"
 
     verify_response = client.get(
         f"/api/transactions/verify/{txn_id}",
-        headers=_ledger_header(),
     )
-    assert verify_response.status_code == 200
-    verify_data = verify_response.get_json()
-    assert verify_data["verified"] is False
-    assert verify_data["reason"] == "Signatur ungültig"
+    assert verify_response.status_code == 404
 
 
-def test_admin_transactions_require_token(client):
-    response = client.get("/api/transactions")
-    assert response.status_code == 401
-    assert response.get_json()["error"] == "Ledger-Token fehlt"
+def test_transactions_require_valid_signature(client):
+    response = client.post(
+        "/api/transactions/txn_no_token",
+        json={
+            "type": "deposit",
+            "amount": "1.00",
+            "timestamp": server._now_iso(),
+            "senderPublicKey": "sender",
+            "receiverPublicKey": "receiver",
+            "signature": "sig",
+        },
+    )
+    assert response.status_code == 400
+    assert response.get_json()["error"] == "Signatur ungültig"
 
 
-def test_transactions_export_returns_all_entries(client):
+def test_transactions_export_all_returns_full_ledger(client):
     register_response, payload, account_id = _register_user(
         client,
         email="quentin@example.com",
@@ -508,9 +497,8 @@ def test_transactions_export_returns_all_entries(client):
         private_key=private_key,
     )
 
-    client.put(
+    client.post(
         "/api/transactions/txn_export_1",
-        headers=_ledger_header(),
         json={
             "type": "deposit",
             "amount": "20.00",
@@ -521,14 +509,69 @@ def test_transactions_export_returns_all_entries(client):
         },
     )
 
-    export_response = client.get(
-        "/api/transactions/export",
-        headers=_ledger_header(),
-    )
+    export_response = client.get("/api/transactions/export/all")
     assert export_response.status_code == 200
-    transactions = export_response.get_json()["transactions"]
+    export_payload = export_response.get_json()
+    assert export_payload["count"] >= 1
+    assert export_payload["exportedAt"]
+    transactions = export_payload["transactions"]
     ids = {entry["transactionId"] for entry in transactions}
     assert "txn_export_1" in ids
+
+
+def test_transactions_export_stream_paginates(client):
+    register_response, payload, account_id = _register_user(
+        client,
+        email="stream@example.com",
+        first_name="Stream",
+        last_name="Tester",
+        initial="0",
+    )
+
+    private_key = _get_private_key(account_id, payload["password"])
+    txn_ids: list[str] = []
+    for idx in range(3):
+        timestamp = server._now_iso()
+        signature = _sign_transaction(
+            txn_type="deposit",
+            sender_public_key=register_response["publicKey"],
+            receiver_public_key=register_response["publicKey"],
+            amount="1.00",
+            timestamp=timestamp,
+            private_key=private_key,
+        )
+        txn_id = f"txn_stream_{idx}"
+        txn_ids.append(txn_id)
+        client.post(
+            f"/api/transactions/{txn_id}",
+            json={
+                "type": "deposit",
+                "amount": "1.00",
+                "timestamp": timestamp,
+                "senderPublicKey": register_response["publicKey"],
+                "receiverPublicKey": register_response["publicKey"],
+                "signature": signature,
+            },
+        )
+
+    first_page = client.get("/api/transactions/export/stream", query_string={"limit": 2})
+    assert first_page.status_code == 200
+    first_payload = first_page.get_json()
+    assert first_payload["count"] == 2
+    assert first_payload["limit"] == 2
+    assert first_payload["sinceId"] is None
+    assert first_payload["nextSinceId"]
+
+    second_page = client.get(
+        "/api/transactions/export/stream",
+        query_string={"limit": 2, "sinceId": first_payload["nextSinceId"]},
+    )
+    assert second_page.status_code == 200
+    second_payload = second_page.get_json()
+    assert second_payload["count"] >= 1
+    assert second_payload["sinceId"] == first_payload["nextSinceId"]
+    ids = {txn["transactionId"] for txn in first_payload["transactions"] + second_payload["transactions"]}
+    assert set(txn_ids).issubset(ids)
 
 
 def test_ledger_instances_register_list_and_heartbeat(client):

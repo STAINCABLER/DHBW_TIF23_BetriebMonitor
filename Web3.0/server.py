@@ -4,21 +4,27 @@ import atexit
 import base64
 import binascii
 import hashlib
+import ipaddress
 import json
 import logging
 import os
 import re
 import secrets
+import socket
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
-from typing import Any, Dict, List, Optional
-from urllib.parse import urlparse
+from types import SimpleNamespace
+from typing import Any, Dict, Iterable, List, Optional, Set
+from urllib.parse import urlparse, urlsplit
 
 import requests
 from dotenv import load_dotenv
 from flask import Flask, Response, jsonify, request
 from marshmallow import Schema, ValidationError, fields, validate
+
+from api import register_apis
 
 from crypto_utils import (
     DecryptionError,
@@ -40,17 +46,60 @@ load_dotenv()
 LOGGER = logging.getLogger("altebank.web3")
 LOGGER.addHandler(logging.NullHandler())
 
+
+class _StoreProxy:
+    """Late-binding proxy so blueprints always talk to the active store."""
+
+    def __getattr__(self, item):
+        return getattr(globals()["store"], item)
+
+    def __setattr__(self, key, value):
+        setattr(globals()["store"], key, value)
+
+
+_STORE_PROXY = _StoreProxy()
+
+
+class ApiContext(SimpleNamespace):
+    """Provides blueprint helpers with the current store instance."""
+
+    @property
+    def store(self):  # type: ignore[override]
+        return _STORE_PROXY
+
 APP_SECRET = os.getenv("APP_SECRET_KEY") or secrets.token_hex(32)
 SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", "3600"))
 SESSION_CLEANUP_INTERVAL_SECONDS = int(os.getenv("SESSION_CLEANUP_INTERVAL_SECONDS", "600"))
 
 LEDGER_API_TOKEN = os.getenv("LEDGER_API_TOKEN", "").strip()
+AUTH_TRANS_TOKEN = os.getenv("AUTH_TRANS_TOKEN", "").strip()
+
+FQDN_ALTEBANK = os.getenv("FQDN_ALTEBANK", "").strip().lower()
+CONTROL_BASE_URL = os.getenv("CONTROL_BASE_URL", "").strip()
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip()
+INSTANCE_ID = os.getenv("INSTANCE_ID", os.getenv("HOSTNAME", "node_" + secrets.token_hex(4))).strip()
+
 LEDGER_SYNC_INTERVAL_SECONDS = int(os.getenv("LEDGER_SYNC_INTERVAL_SECONDS", "60"))
+INSTANCE_HEARTBEAT_INTERVAL_SECONDS = int(os.getenv("INSTANCE_HEARTBEAT_INTERVAL_SECONDS", "120"))
+INSTANCE_STALE_THRESHOLD_SECONDS = int(os.getenv("INSTANCE_STALE_THRESHOLD_SECONDS", str(10 * 60)))
+INSTANCE_STALE_GRACE_SECONDS = int(os.getenv("INSTANCE_STALE_GRACE_SECONDS", str(5 * 60)))
+CONTROL_HEALTH_INTERVAL_SECONDS = int(os.getenv("CONTROL_HEALTH_INTERVAL_SECONDS", "60"))
 
 user_key_pepper_raw = os.getenv("USER_KEY_ENC_SECRET", "").strip()
 USER_KEY_PEPPER: Optional[bytes] = user_key_pepper_raw.encode("utf-8") if user_key_pepper_raw else None
 
 BANK_PUBLIC_KEY = os.getenv("BANK_PUBLIC_KEY", "BANK_SYSTEM").strip()
+
+_EXTERNAL_IP_LOOKUP_ENDPOINTS = [endpoint.strip() for endpoint in os.getenv(
+    "EXTERNAL_IP_LOOKUP_ENDPOINTS",
+    "https://api.ipify.org,https://ifconfig.me/ip",
+).split(",") if endpoint.strip()]
+
+SERVER_EXTERNAL_IP: Optional[str] = None
+SERVER_ROLE: str = "control"
+SERVER_BASE_URL: Optional[str] = None
+CONTROL_SERVER_BASE_URL: Optional[str] = None
+FAILED_NODE_CHECKS: Dict[str, datetime] = {}
 
 _BALANCE_ADJUST_SCRIPT = """
 local key = KEYS[1]
@@ -101,16 +150,125 @@ def _ledger_headers(token: str) -> Dict[str, str]:
     return {"X-Ledger-Token": token} if token else {}
 
 
-def _normalize_base_url(raw: Any) -> str:
-    if not isinstance(raw, str):
-        raise ValueError("Ungültige URL")
-    candidate = raw.strip()
-    if not candidate:
-        raise ValueError("URL darf nicht leer sein")
-    if not candidate.startswith(("https://", "http://")):
-        candidate = f"https://{candidate}"
-    return candidate.rstrip("/")
+def _auth_trans_headers(token: str) -> Dict[str, str]:
+    return {"X-Auth-Trans-Token": token} if token else {}
 
+
+def _determine_external_ip() -> Optional[str]:
+    for endpoint in _EXTERNAL_IP_LOOKUP_ENDPOINTS:
+        try:
+            response = requests.get(endpoint, timeout=5)
+            if response.status_code == 200:
+                candidate = response.text.strip()
+                if candidate:
+                    return candidate
+        except requests.RequestException:
+            continue
+    return None
+
+
+def _resolve_fqdn_ips(fqdn: str) -> Set[str]:
+    ips: Set[str] = set()
+    if not fqdn:
+        return ips
+    try:
+        addr_info = socket.getaddrinfo(fqdn, None)
+    except socket.gaierror:
+        return ips
+    for info in addr_info:
+        if len(info) >= 5:
+            host = info[4][0]
+            if host:
+                ips.add(host)
+    return ips
+
+
+def _ip_matches(candidate: str, targets: Iterable[str]) -> bool:
+    try:
+        cand_ip = ipaddress.ip_address(candidate)
+    except ValueError:
+        return False
+    for target in targets:
+        try:
+            if cand_ip == ipaddress.ip_address(target):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _normalize_base_url(url: str, default_scheme: str = "https") -> str:
+    if not url:
+        raise ValueError("URL darf nicht leer sein")
+    parsed = urlsplit(url if "://" in url else f"{default_scheme}://{url}")
+    scheme = parsed.scheme or default_scheme
+    netloc = parsed.netloc or parsed.path
+    path = parsed.path if parsed.netloc else ""
+    if not netloc:
+        raise ValueError("Ungültige URL")
+    normalized = f"{scheme}://{netloc}"
+    if path and path != "/":
+        normalized = f"{normalized}{path.rstrip('/')}"
+    return normalized.rstrip("/")
+
+
+def _build_default_base_url(external_ip: Optional[str]) -> str:
+    scheme = os.getenv("PUBLIC_BASE_SCHEME", "https").strip() or "https"
+    port = os.getenv("PUBLIC_PORT", os.getenv("PORT", "8000")).strip()
+    host = os.getenv("PUBLIC_HOST", external_ip or "127.0.0.1")
+    if not host:
+        host = "127.0.0.1"
+    default_ports = {"http": "80", "https": "443"}
+    include_port = port and port not in (default_ports.get(scheme), "")
+    netloc = f"{host}:{port}" if include_port else host
+    return f"{scheme}://{netloc}".rstrip("/")
+
+
+def _determine_server_role() -> None:
+    global SERVER_EXTERNAL_IP, SERVER_ROLE, SERVER_BASE_URL, CONTROL_SERVER_BASE_URL
+
+    if not FQDN_ALTEBANK:
+        SERVER_ROLE = "control"
+        SERVER_EXTERNAL_IP = os.getenv("EXTERNAL_IP_OVERRIDE", "127.0.0.1")
+        SERVER_BASE_URL = _normalize_base_url(PUBLIC_BASE_URL or _build_default_base_url(SERVER_EXTERNAL_IP), default_scheme="http")
+        CONTROL_SERVER_BASE_URL = SERVER_BASE_URL
+        return
+
+    external_ip = _determine_external_ip()
+    if not external_ip:
+        raise SystemExit("Öffentliche IP-Adresse konnte nicht ermittelt werden. Bitte Internetzugang prüfen.")
+
+    resolved_ips = _resolve_fqdn_ips(FQDN_ALTEBANK)
+    SERVER_EXTERNAL_IP = external_ip
+
+    is_control = _ip_matches(external_ip, resolved_ips)
+    SERVER_ROLE = "control" if is_control else "member"
+
+    base_url_candidate = PUBLIC_BASE_URL or _build_default_base_url(external_ip)
+    try:
+        SERVER_BASE_URL = _normalize_base_url(base_url_candidate)
+    except ValueError:
+        SERVER_BASE_URL = _build_default_base_url(external_ip)
+
+    if CONTROL_BASE_URL:
+        try:
+            CONTROL_SERVER_BASE_URL = _normalize_base_url(CONTROL_BASE_URL)
+        except ValueError:
+            CONTROL_SERVER_BASE_URL = f"https://{FQDN_ALTEBANK}"
+    else:
+        CONTROL_SERVER_BASE_URL = f"https://{FQDN_ALTEBANK}"
+
+    if SERVER_ROLE == "control":
+        CONTROL_SERVER_BASE_URL = SERVER_BASE_URL
+
+
+try:
+    _determine_server_role()
+except SystemExit:
+    raise
+except Exception as exc:  # pragma: no cover - defensive bootstrap
+    print(f"Cluster-Rollenzuordnung fehlgeschlagen: {exc}")
+    raise SystemExit(1)
 
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 NAME_RE = re.compile(r"^[A-Za-zÀ-ÖØ-öø-ÿ' -]{2,50}$")
@@ -251,13 +409,7 @@ class _KeypairDeleteSchema(Schema):
     password = fields.String(required=True, validate=validate.Length(min=6))
 
 
-class _TransactionsQuerySchema(Schema):
-    partner = fields.String(load_default=None)
-    limit = fields.Integer(load_default=100, validate=validate.Range(min=1, max=500))
-    since_id = fields.String(load_default=None, data_key="sinceId")
-
-
-class _TransactionsInjectionSchema(Schema):
+class _IncomingTransactionSchema(Schema):
     transaction_id = fields.String(load_default=None, data_key="transactionId")
     type = fields.String(
         required=True,
@@ -269,14 +421,11 @@ class _TransactionsInjectionSchema(Schema):
     receiver_public_key = fields.String(required=True, data_key="receiverPublicKey")
     signature = fields.String(required=True)
     metadata = fields.Dict(keys=fields.String(), values=fields.Raw(), load_default=None)
-    allow_update = fields.Boolean(load_default=False, data_key="allowUpdate")
-    skip_signature_check = fields.Boolean(load_default=False, data_key="skipSignatureCheck")
 
 
 _KEYPAIR_ROTATE_SCHEMA = _KeypairRotateSchema()
 _KEYPAIR_DELETE_SCHEMA = _KeypairDeleteSchema()
-_TRANSACTIONS_QUERY_SCHEMA = _TransactionsQuerySchema()
-_TRANSACTIONS_INJECTION_SCHEMA = _TransactionsInjectionSchema()
+_INCOMING_TRANSACTION_SCHEMA = _IncomingTransactionSchema()
 
 
 class _LedgerInstanceRegisterSchema(Schema):
@@ -1058,9 +1207,9 @@ def _compute_iban_check_digits(country_code: str, bban: str) -> str:
 
 
 def _generate_iban() -> str:
+    bank_code = "04102025"
     attempts = 0
-    while attempts < 20:
-        bank_code = f"{secrets.randbelow(10**8):08d}"
+    while attempts < 50:
         account_number = f"{secrets.randbelow(10**10):010d}"
         bban = f"{bank_code}{account_number}"
         check_digits = _compute_iban_check_digits("DE", bban)
@@ -1509,6 +1658,87 @@ def _error(message: str, status: int = 400):
     return jsonify({"error": message}), status
 
 
+def _collect_all_ledger_transactions(batch_size: int = 200) -> List[Dict[str, Any]]:
+    collected: List[Dict[str, Any]] = []
+    cursor: Optional[str] = None
+    while True:
+        batch = store.list_ledger_transactions(after_transaction_id=cursor, limit=batch_size)
+        if not batch:
+            break
+        collected.extend(batch)
+        cursor = batch[-1].get("transactionId")
+        if len(batch) < batch_size or not cursor:
+            break
+    return collected
+
+
+def _paginate_ledger_transactions(*, since_id: Optional[str], limit: int) -> Dict[str, Any]:
+    batch = store.list_ledger_transactions(after_transaction_id=since_id, limit=limit)
+    next_cursor: Optional[str] = None
+    if batch and len(batch) == limit:
+        next_cursor = batch[-1].get("transactionId")
+    return {
+        "transactions": batch,
+        "count": len(batch),
+        "nextSinceId": next_cursor,
+    }
+
+
+def _register_api_blueprints() -> None:
+    ctx = ApiContext(
+        error=_error,
+        require_auth=_require_auth,
+        require_ledger_token=_require_ledger_token,
+        ledger_error_response=_ledger_error_response,
+        get_configured_ledger_nodes=_get_configured_ledger_nodes,
+        ledger_instance_register_schema=_LEDGER_INSTANCE_REGISTER_SCHEMA,
+        ledger_instance_update_schema=_LEDGER_INSTANCE_UPDATE_SCHEMA,
+        ledger_heartbeat_schema=_LEDGER_HEARTBEAT_SCHEMA,
+        normalize_base_url=_normalize_base_url,
+        now_iso=_now_iso,
+        validation_error_message=_validation_error_message,
+        clean_email=_clean_email,
+        clean_password=_clean_password,
+        clean_name=_clean_name,
+        clean_iban=_clean_iban,
+        parse_amount=_parse_amount,
+        hash_password=_hash_password,
+        generate_account_id=_generate_account_id,
+        generate_iban=_generate_iban,
+        pick_random_advisor=_pick_random_advisor,
+        get_advisor_by_id=_get_advisor_by_id,
+        issue_user_keypair=_issue_user_keypair,
+        keypair_rotate_schema=_KEYPAIR_ROTATE_SCHEMA,
+        keypair_delete_schema=_KEYPAIR_DELETE_SCHEMA,
+        persist_transaction=_persist_transaction,
+        record_account_transaction=_record_account_transaction,
+        format_amount=_format_amount,
+        get_user_key_material=_get_user_key_material,
+        ensure_user_key_material=_ensure_user_key_material,
+        set_user_key_material=_set_user_key_material,
+        delete_user_key_material=_delete_user_key_material,
+        verify_password=_verify_password,
+        issue_session=_issue_session,
+        user_key_pepper=USER_KEY_PEPPER,
+        decrypt_private_key=decrypt_private_key,
+        encrypt_private_key=encrypt_private_key,
+        sign_message_b64=sign_message_b64,
+        build_transaction_message=_build_transaction_message,
+        decryption_error=DecryptionError,
+        generate_user_keypair=generate_user_keypair,
+        verify_transaction_signature=_verify_transaction_signature,
+        generate_transaction_id=_generate_transaction_id,
+        bank_public_key=BANK_PUBLIC_KEY,
+        collect_all_ledger_transactions=_collect_all_ledger_transactions,
+        paginate_ledger_transactions=_paginate_ledger_transactions,
+        incoming_transaction_schema=_INCOMING_TRANSACTION_SCHEMA,
+    )
+    register_apis(app, ctx)
+
+
+_register_api_blueprints()
+
+
 @app.get("/config.js")
 def config_js() -> Response:
     debug_flag = "true" if app.debug else "false"
@@ -1524,1135 +1754,6 @@ def config_js() -> Response:
 @app.get("/")
 def index() -> Any:
     return app.send_static_file("index.html")
-
-
-@app.get("/api/ledger/nodes")
-def ledger_nodes() -> Any:
-    try:
-        _require_ledger_token()
-    except PermissionError as exc:
-        return _ledger_error_response(exc)
-
-    nodes_config = _get_configured_ledger_nodes()
-    nodes_payload: List[Dict[str, Any]] = []
-    for node in nodes_config:
-        base_url = node.get("base_url")
-        if not base_url:
-            continue
-        entry: Dict[str, Any] = {"baseUrl": base_url}
-        token = node.get("token")
-        if token:
-            entry["token"] = token
-        nodes_payload.append(entry)
-    return jsonify({"nodes": nodes_payload})
-
-
-def _ledger_instances_store_available() -> bool:
-    return all(
-        callable(getattr(store, attr, None))
-        for attr in ("list_bank_instances", "register_bank_instance", "upsert_bank_instance", "delete_bank_instance")
-    )
-
-
-@app.get("/api/ledger/instances")
-def ledger_instances_list() -> Any:
-    try:
-        _require_ledger_token()
-    except PermissionError as exc:
-        return _ledger_error_response(exc)
-
-    if not _ledger_instances_store_available():  # pragma: no cover - defensive guard
-        return jsonify({"instances": []})
-
-    instances = store.list_bank_instances()
-    return jsonify({"instances": instances})
-
-
-@app.post("/api/ledger/instances")
-def ledger_instances_register() -> Any:
-    try:
-        _require_ledger_token()
-    except PermissionError as exc:
-        return _ledger_error_response(exc)
-
-    if not _ledger_instances_store_available():  # pragma: no cover - defensive guard
-        return _error("Bankinstanzen können derzeit nicht verwaltet werden", 503)
-
-    payload = request.get_json(force=True, silent=True) or {}
-    try:
-        data = _LEDGER_INSTANCE_REGISTER_SCHEMA.load(payload)
-    except ValidationError as exc:
-        return _error(_validation_error_message(exc))
-
-    instance_id = data["instance_id"].strip()
-    try:
-        base_url = _normalize_base_url(data["base_url"])
-    except ValueError as exc:
-        return _error(str(exc))
-
-    record: Dict[str, Any] = {
-        "baseUrl": base_url,
-        "lastSeen": data.get("last_seen") or _now_iso(),
-    }
-    if data.get("public_key") is not None:
-        record["publicKey"] = data["public_key"]
-    token_value = (data.get("token") or "").strip()
-    if token_value:
-        record["token"] = token_value
-    if data.get("metadata") is not None:
-        record["metadata"] = data["metadata"]
-    if data.get("status") is not None:
-        record["status"] = data["status"]
-
-    try:
-        store.register_bank_instance(instance_id, record)
-    except ValueError as exc:
-        message = str(exc)
-        status = 409 if "existiert" in message.lower() else 400
-        return _error(message, status)
-
-    stored = store.get_bank_instance(instance_id)
-    return jsonify(stored), 201
-
-
-@app.get("/api/ledger/instances/<string:instance_id>")
-def ledger_instances_get(instance_id: str) -> Any:
-    try:
-        _require_ledger_token()
-    except PermissionError as exc:
-        return _ledger_error_response(exc)
-
-    getter = getattr(store, "get_bank_instance", None)
-    if not callable(getter):  # pragma: no cover - defensive guard
-        return _error("Bankinstanzen können derzeit nicht verwaltet werden", 503)
-
-    record = getter(instance_id)
-    if not record:
-        return _error("Instanz nicht gefunden", 404)
-    return jsonify(record)
-
-
-def _apply_instance_update(instance_id: str, update: Dict[str, Any], *, require_existing: bool = False) -> Dict[str, Any]:
-    getter = getattr(store, "get_bank_instance", None)
-    if not callable(getter):  # pragma: no cover - defensive guard
-        raise RuntimeError("Bankinstanzen können derzeit nicht verwaltet werden")
-
-    existing = getter(instance_id)
-    if require_existing and not existing:
-        raise LookupError("Instanz nicht gefunden")
-
-    record = existing.copy() if existing else {}
-
-    if "base_url" in update and update["base_url"] is not None:
-        record["baseUrl"] = _normalize_base_url(update["base_url"])
-    if "public_key" in update and update["public_key"] is not None:
-        record["publicKey"] = update["public_key"]
-    if "token" in update:
-        token_value = (update.get("token") or "").strip()
-        if token_value:
-            record["token"] = token_value
-        else:
-            record.pop("token", None)
-    if "metadata" in update and update["metadata"] is not None:
-        record["metadata"] = update["metadata"]
-    if "status" in update and update["status"] is not None:
-        record["status"] = update["status"]
-    if "last_seen" in update and update["last_seen"] is not None:
-        record["lastSeen"] = update["last_seen"]
-    else:
-        record["lastSeen"] = _now_iso()
-
-    store.upsert_bank_instance(instance_id, record)
-    updated = getter(instance_id)
-    if not updated:  # pragma: no cover - defensive guard
-        raise LookupError("Instanz nicht gefunden")
-    return updated
-
-
-@app.put("/api/ledger/instances/<string:instance_id>")
-def ledger_instances_update(instance_id: str) -> Any:
-    try:
-        _require_ledger_token()
-    except PermissionError as exc:
-        return _ledger_error_response(exc)
-
-    if not _ledger_instances_store_available():  # pragma: no cover - defensive guard
-        return _error("Bankinstanzen können derzeit nicht verwaltet werden", 503)
-
-    payload = request.get_json(force=True, silent=True) or {}
-    try:
-        data = _LEDGER_INSTANCE_UPDATE_SCHEMA.load(payload)
-    except ValidationError as exc:
-        return _error(_validation_error_message(exc))
-
-    existing = store.get_bank_instance(instance_id) if callable(getattr(store, "get_bank_instance", None)) else None
-    if existing is None and data.get("base_url") in (None, ""):
-        return _error("baseUrl wird für neue Instanzen benötigt")
-    try:
-        updated = _apply_instance_update(instance_id, data)
-    except LookupError:
-        return _error("Instanz nicht gefunden", 404)
-    except ValueError as exc:
-        return _error(str(exc))
-
-    status_code = 200 if existing else 201
-    return jsonify(updated), status_code
-
-
-@app.post("/api/ledger/instances/<string:instance_id>/heartbeat")
-def ledger_instances_heartbeat(instance_id: str) -> Any:
-    try:
-        _require_ledger_token()
-    except PermissionError as exc:
-        return _ledger_error_response(exc)
-
-    if not _ledger_instances_store_available():  # pragma: no cover - defensive guard
-        return _error("Bankinstanzen können derzeit nicht verwaltet werden", 503)
-
-    payload = request.get_json(force=True, silent=True) or {}
-    try:
-        data = _LEDGER_HEARTBEAT_SCHEMA.load(payload)
-    except ValidationError as exc:
-        return _error(_validation_error_message(exc))
-
-    try:
-        update_payload = {
-            "status": data.get("status"),
-            "metadata": data.get("metadata"),
-            "last_seen": _now_iso(),
-        }
-        updated = _apply_instance_update(instance_id, update_payload, require_existing=True)
-    except LookupError:
-        return _error("Instanz nicht gefunden", 404)
-    except ValueError as exc:
-        return _error(str(exc))
-
-    return jsonify(updated)
-
-
-@app.delete("/api/ledger/instances/<string:instance_id>")
-def ledger_instances_delete(instance_id: str) -> Any:
-    try:
-        _require_ledger_token()
-    except PermissionError as exc:
-        return _ledger_error_response(exc)
-
-    deleter = getattr(store, "delete_bank_instance", None)
-    if not callable(deleter):  # pragma: no cover - defensive guard
-        return _error("Bankinstanzen können derzeit nicht verwaltet werden", 503)
-
-    deleter(instance_id)
-    return jsonify({"success": True})
-
-
-@app.post("/api/auth/register")
-def register() -> Any:
-    payload = request.get_json(force=True, silent=True) or {}
-    try:
-        email = _clean_email(payload.get("email"))
-        password = _clean_password(payload.get("password"))
-        first_name = _clean_name(payload.get("firstName"), "Vorname")
-        last_name = _clean_name(payload.get("lastName"), "Nachname")
-        initial = _parse_amount(payload.get("initialDeposit", "0"))
-        if initial < Decimal("0"):
-            raise ValueError("Initialer Betrag darf nicht negativ sein")
-    except ValueError as exc:
-        return _error(str(exc))
-
-    email_exists = getattr(store, "email_exists", None)
-    if email_exists and email_exists(email):
-        return _error("E-Mail existiert bereits", 409)
-
-    credentials = _hash_password(password)
-    account_id = _generate_account_id()
-    iban = _generate_iban()
-    advisor = _pick_random_advisor()
-    store.create_user(
-        account_id,
-        {
-            "username": account_id,
-            "email": email,
-            "first_name": first_name,
-            "last_name": last_name,
-            "iban": iban,
-            "salt": credentials["salt"],
-            "password_hash": credentials["password_hash"],
-            "balance": _format_amount(Decimal("0")),
-            "advisor_id": advisor["id"],
-        },
-    )
-
-    key_material = _issue_user_keypair(account_id, password, expose_private=True)
-    private_key_bytes = key_material.pop("_privateKeyBytes", None)
-
-    if initial > Decimal("0"):
-        sender_public_key = key_material["publicKey"]
-        receiver_public_key = sender_public_key
-        timestamp = _now_iso()
-        amount_str = _format_amount(initial)
-        if private_key_bytes is None:
-            try:
-                material = _get_user_key_material(account_id)
-                if material:
-                    private_key_bytes = decrypt_private_key(
-                        password,
-                        material["encryptedPrivateKey"],
-                        pepper=USER_KEY_PEPPER,
-                    )
-            except DecryptionError:
-                private_key_bytes = None
-        signature = ""
-        if private_key_bytes is not None:
-            message = _build_transaction_message(
-                "deposit",
-                sender_public_key,
-                receiver_public_key,
-                amount_str,
-                timestamp,
-            )
-            signature = sign_message_b64(private_key_bytes, message)
-
-        new_balance = store.adjust_balance(account_id, initial)
-        _persist_transaction(
-            username=account_id,
-            txn_type="deposit",
-            amount=initial,
-            balance=new_balance,
-            memo="Initiale Einzahlung",
-            sender_public_key=sender_public_key,
-            receiver_public_key=receiver_public_key,
-            signature=signature,
-            timestamp=timestamp,
-        )
-
-    token = _issue_session(account_id)
-    return jsonify(
-        {
-            "token": token,
-            "firstName": first_name,
-            "lastName": last_name,
-            "iban": iban,
-            "publicKey": key_material["publicKey"],
-            "keyCreatedAt": key_material["createdAt"],
-            "encryptedPrivateKey": key_material["encryptedPrivateKey"],
-            "advisor": advisor,
-        }
-    )
-
-
-@app.post("/api/auth/login")
-def login() -> Any:
-    payload = request.get_json(force=True, silent=True) or {}
-    try:
-        email = _clean_email(payload.get("email"))
-        password = _clean_password(payload.get("password"))
-    except ValueError as exc:
-        return _error(str(exc))
-
-    user = getattr(store, "get_user_by_email", lambda _: None)(email)
-    if not user or not _verify_password(password, user):
-        return _error("Ungültige Zugangsdaten", 401)
-
-    account_id = user.get("username")
-    if not account_id:
-        return _error("Benutzerkonto beschädigt", 500)
-
-    token = _issue_session(account_id)
-    key_material = _ensure_user_key_material(account_id, password)
-    return jsonify(
-        {
-            "token": token,
-            "firstName": user.get("first_name"),
-            "lastName": user.get("last_name"),
-            "iban": user.get("iban"),
-            "publicKey": key_material.get("publicKey") if key_material else None,
-            "keyCreatedAt": key_material.get("createdAt") if key_material else None,
-            "encryptedPrivateKey": key_material.get("encryptedPrivateKey") if key_material else None,
-        }
-    )
-
-
-@app.post("/api/auth/logout")
-def logout() -> Any:
-    try:
-        username = _require_auth()
-        token = request.environ.get("session_token")
-        if token:
-            store.delete_session(token)
-        return jsonify({"success": True, "username": username})
-    except PermissionError as exc:
-        return _error(str(exc), 401)
-
-
-@app.put("/api/auth/password")
-def update_password() -> Any:
-    try:
-        username = _require_auth()
-    except PermissionError as exc:
-        return _error(str(exc), 401)
-
-    payload = request.get_json(force=True, silent=True) or {}
-    try:
-        current_password = _clean_password(payload.get("currentPassword"))
-        new_password = _clean_password(payload.get("newPassword"))
-    except ValueError as exc:
-        return _error(str(exc))
-
-    confirm_password = payload.get("confirmPassword")
-    if confirm_password is not None:
-        confirm_clean = str(confirm_password).strip()
-        if confirm_clean != new_password:
-            return _error("Neue Passwörter stimmen nicht überein")
-
-    user = store.get_user(username)
-    if not user:
-        return _error("Benutzer nicht gefunden", 404)
-
-    if not _verify_password(current_password, user):
-        return _error("Aktuelles Passwort ist falsch", 400)
-
-    credentials = _hash_password(new_password)
-    try:
-        store.set_user_field(username, "salt", credentials["salt"])
-        store.set_user_field(username, "password_hash", credentials["password_hash"])
-    except KeyError as exc:
-        return _error(str(exc), 404)
-
-    key_material = _get_user_key_material(username)
-    if key_material:
-        try:
-            private_key_bytes = decrypt_private_key(
-                current_password,
-                key_material["encryptedPrivateKey"],
-                pepper=USER_KEY_PEPPER,
-            )
-        except DecryptionError:
-            return _error("Schlüssel konnte nicht entschlüsselt werden", 500)
-
-        new_payload = encrypt_private_key(
-            new_password,
-            private_key_bytes,
-            pepper=USER_KEY_PEPPER,
-        )
-        _set_user_key_material(
-            username,
-            public_key=key_material["publicKey"],
-            encrypted_private_key=new_payload,
-            created_at=_now_iso(),
-        )
-    else:
-        _ensure_user_key_material(username, new_password)
-
-    return jsonify({"success": True})
-
-
-@app.get("/api/user/keypair")
-def user_keypair_get() -> Any:
-    try:
-        username = _require_auth()
-    except PermissionError as exc:
-        return _error(str(exc), 401)
-
-    material = _get_user_key_material(username)
-    if not material:
-        return _error("Schlüsselmaterial nicht gefunden", 404)
-
-    return jsonify(
-        {
-            "publicKey": material.get("publicKey"),
-            "createdAt": material.get("createdAt"),
-            "encryptedPrivateKey": material.get("encryptedPrivateKey"),
-        }
-    )
-
-
-@app.post("/api/user/keypair")
-def user_keypair_rotate() -> Any:
-    try:
-        username = _require_auth()
-    except PermissionError as exc:
-        return _error(str(exc), 401)
-
-    payload = request.get_json(force=True, silent=True) or {}
-    try:
-        data = _KEYPAIR_ROTATE_SCHEMA.load(payload)
-    except ValidationError as exc:
-        return _error(_validation_error_message(exc))
-
-    user = store.get_user(username)
-    if not user:
-        return _error("Benutzer nicht gefunden", 404)
-    if not _verify_password(data["password"], user):
-        return _error("Passwort ist falsch", 400)
-
-    previous_material = _get_user_key_material(username)
-
-    keypair = generate_user_keypair()
-    encrypted = encrypt_private_key(
-        data["password"],
-        keypair.private_key,
-        pepper=USER_KEY_PEPPER,
-    )
-    created_at = _now_iso()
-    _set_user_key_material(
-        username,
-        public_key=keypair.public_key_b64(),
-        encrypted_private_key=encrypted,
-        created_at=created_at,
-    )
-
-    response_body: Dict[str, Any] = {
-        "publicKey": keypair.public_key_b64(),
-        "encryptedPrivateKey": encrypted,
-        "createdAt": created_at,
-    }
-    if previous_material and previous_material.get("publicKey"):
-        response_body["previousPublicKey"] = previous_material.get("publicKey")
-    if data.get("expose_private_key"):
-        response_body["privateKey"] = base64.b64encode(keypair.private_key).decode("ascii")
-
-    return jsonify(response_body), 201
-
-
-@app.delete("/api/user/keypair")
-def user_keypair_delete() -> Any:
-    try:
-        username = _require_auth()
-    except PermissionError as exc:
-        return _error(str(exc), 401)
-
-    payload = request.get_json(force=True, silent=True) or {}
-    try:
-        data = _KEYPAIR_DELETE_SCHEMA.load(payload)
-    except ValidationError as exc:
-        return _error(_validation_error_message(exc))
-
-    user = store.get_user(username)
-    if not user:
-        return _error("Benutzer nicht gefunden", 404)
-    if not _verify_password(data["password"], user):
-        return _error("Passwort ist falsch", 400)
-
-    material = _get_user_key_material(username)
-    if not material:
-        return _error("Schlüsselmaterial nicht gefunden", 404)
-
-    _delete_user_key_material(username)
-
-    return jsonify({
-        "success": True,
-        "revokedPublicKey": material.get("publicKey"),
-    })
-
-
-@app.get("/api/accounts/me")
-def account_me() -> Any:
-    try:
-        username = _require_auth()
-    except PermissionError as exc:
-        return _error(str(exc), 401)
-
-    user = store.get_user(username)
-    if not user:
-        return _error("Benutzer nicht gefunden", 404)
-
-    txns = store.get_transactions(username)
-    advisor_id = user.get("advisor_id")
-    if not advisor_id:
-        advisor_profile = _pick_random_advisor()
-        try:
-            store.set_user_field(username, "advisor_id", advisor_profile["id"])
-        except Exception:
-            pass
-    else:
-        advisor_profile = _get_advisor_by_id(str(advisor_id))
-    key_material = _get_user_key_material(username)
-    return jsonify(
-        {
-            "accountId": username,
-            "email": user.get("email"),
-            "firstName": user.get("first_name"),
-            "lastName": user.get("last_name"),
-            "iban": user.get("iban"),
-            "balance": user.get("balance", "0.00"),
-            "transactions": txns,
-            "advisor": advisor_profile,
-            "publicKey": key_material.get("publicKey") if key_material else None,
-            "keyCreatedAt": key_material.get("createdAt") if key_material else None,
-            "encryptedPrivateKey": key_material.get("encryptedPrivateKey") if key_material else None,
-            "bankPublicKey": BANK_PUBLIC_KEY,
-        }
-    )
-
-
-@app.put("/api/accounts/me")
-def account_update() -> Any:
-    try:
-        username = _require_auth()
-    except PermissionError as exc:
-        return _error(str(exc), 401)
-
-    payload = request.get_json(force=True, silent=True) or {}
-    try:
-        first_name = _clean_name(payload.get("firstName"), "Vorname")
-        last_name = _clean_name(payload.get("lastName"), "Nachname")
-        email = _clean_email(payload.get("email"))
-    except ValueError as exc:
-        return _error(str(exc))
-
-    updater = getattr(store, "update_user_profile", None)
-    if not callable(updater):  # pragma: no cover - alle Stores sollten dies unterstützen
-        return _error("Profilaktualisierung derzeit nicht möglich", 500)
-
-    try:
-        updater(
-            username,
-            first_name=first_name,
-            last_name=last_name,
-            email=email,
-        )
-    except KeyError:
-        return _error("Benutzer nicht gefunden", 404)
-    except ValueError as exc:
-        message = str(exc)
-        status = 409 if "existiert" in message else 400
-        return _error(message, status)
-
-    return jsonify({"success": True})
-
-
-@app.delete("/api/accounts/me")
-def account_delete() -> Any:
-    try:
-        username = _require_auth()
-    except PermissionError as exc:
-        return _error(str(exc), 401)
-
-    payload = request.get_json(force=True, silent=True) or {}
-    try:
-        confirm_iban = _clean_iban(payload.get("confirmIban"))
-    except ValueError as exc:
-        return _error(str(exc))
-
-    user = store.get_user(username)
-    if not user:
-        return _error("Benutzer nicht gefunden", 404)
-
-    stored_iban = str(user.get("iban") or "").replace(" ", "").upper()
-    if not stored_iban:
-        return _error("IBAN fehlt für dieses Konto", 400)
-    if confirm_iban != stored_iban:
-        return _error("IBAN stimmt nicht überein", 400)
-
-    deleter = getattr(store, "delete_user", None)
-    if deleter is None:
-        return _error("Kontolöschung derzeit nicht möglich", 500)
-
-    try:
-        deleter(username)
-    except KeyError as exc:
-        return _error(str(exc), 404)
-
-    token = request.environ.get("session_token")
-    if token:
-        store.delete_session(token)
-
-    _delete_user_key_material(username)
-
-    return jsonify({"success": True})
-
-
-@app.post("/api/accounts/deposit")
-def account_deposit() -> Any:
-    try:
-        username = _require_auth()
-    except PermissionError as exc:
-        return _error(str(exc), 401)
-
-    payload = request.get_json(force=True, silent=True) or {}
-    try:
-        amount = _parse_amount(payload.get("amount"))
-        if amount <= Decimal("0"):
-            raise ValueError("Betrag muss positiv sein")
-    except ValueError as exc:
-        return _error(str(exc))
-
-    timestamp_raw = payload.get("timestamp")
-    if not isinstance(timestamp_raw, str) or not timestamp_raw.strip():
-        return _error("Zeitstempel fehlt")
-    timestamp = timestamp_raw.strip()
-
-    signature_raw = payload.get("signature")
-    if not isinstance(signature_raw, str) or not signature_raw.strip():
-        return _error("Signatur fehlt")
-    signature = signature_raw.strip()
-
-    key_material = _get_user_key_material(username)
-    if not key_material:
-        return _error("Schlüsselmaterial nicht gefunden", 500)
-
-    sender_public_key = key_material.get("publicKey")
-    receiver_public_key = sender_public_key
-    amount_str = _format_amount(amount.copy_abs())
-
-    if not _verify_transaction_signature(
-        "deposit",
-        sender_public_key,
-        receiver_public_key,
-        amount_str,
-        timestamp,
-        signature,
-    ):
-        return _error("Signatur ungültig", 400)
-
-    try:
-        balance = store.adjust_balance(username, amount)
-    except (KeyError, ValueError) as exc:
-        return _error(str(exc), 400)
-
-    transaction_id = _persist_transaction(
-        username=username,
-        txn_type="deposit",
-        amount=amount,
-        balance=balance,
-        memo="Einzahlung",
-        sender_public_key=sender_public_key,
-        receiver_public_key=receiver_public_key,
-        signature=signature,
-        timestamp=timestamp,
-    )
-    return jsonify({"balance": _format_amount(balance), "transactionId": transaction_id})
-
-
-@app.post("/api/accounts/withdraw")
-def account_withdraw() -> Any:
-    try:
-        username = _require_auth()
-    except PermissionError as exc:
-        return _error(str(exc), 401)
-
-    payload = request.get_json(force=True, silent=True) or {}
-    try:
-        amount = _parse_amount(payload.get("amount"))
-        if amount <= Decimal("0"):
-            raise ValueError("Betrag muss positiv sein")
-    except ValueError as exc:
-        return _error(str(exc))
-
-    timestamp_raw = payload.get("timestamp")
-    if not isinstance(timestamp_raw, str) or not timestamp_raw.strip():
-        return _error("Zeitstempel fehlt")
-    timestamp = timestamp_raw.strip()
-
-    signature_raw = payload.get("signature")
-    if not isinstance(signature_raw, str) or not signature_raw.strip():
-        return _error("Signatur fehlt")
-    signature = signature_raw.strip()
-
-    key_material = _get_user_key_material(username)
-    if not key_material:
-        return _error("Schlüsselmaterial nicht gefunden", 500)
-
-    sender_public_key = key_material.get("publicKey")
-    receiver_public_key = BANK_PUBLIC_KEY
-    amount_str = _format_amount(amount.copy_abs())
-
-    if not _verify_transaction_signature(
-        "withdraw",
-        sender_public_key,
-        receiver_public_key,
-        amount_str,
-        timestamp,
-        signature,
-    ):
-        return _error("Signatur ungültig", 400)
-
-    try:
-        balance = store.adjust_balance(username, -amount)
-    except ValueError as exc:
-        return _error(str(exc), 400)
-    except KeyError as exc:
-        return _error(str(exc), 404)
-
-    transaction_id = _persist_transaction(
-        username=username,
-        txn_type="withdraw",
-        amount=-amount,
-        ledger_amount=amount,
-        balance=balance,
-        memo="Auszahlung",
-        sender_public_key=sender_public_key,
-        receiver_public_key=receiver_public_key,
-        signature=signature,
-        timestamp=timestamp,
-    )
-    return jsonify({"balance": _format_amount(balance), "transactionId": transaction_id})
-
-
-@app.post("/api/accounts/transfer")
-def account_transfer() -> Any:
-    try:
-        username = _require_auth()
-    except PermissionError as exc:
-        return _error(str(exc), 401)
-
-    payload = request.get_json(force=True, silent=True) or {}
-    try:
-        target_iban = _clean_iban(payload.get("targetIban"))
-        target_first = _clean_name(payload.get("targetFirstName"), "Empfänger-Vorname")
-        target_last = _clean_name(payload.get("targetLastName"), "Empfänger-Nachname")
-        amount = _parse_amount(payload.get("amount"))
-        if amount <= Decimal("0"):
-            raise ValueError("Betrag muss positiv sein")
-    except ValueError as exc:
-        return _error(str(exc))
-
-    timestamp_raw = payload.get("timestamp")
-    if not isinstance(timestamp_raw, str) or not timestamp_raw.strip():
-        return _error("Zeitstempel fehlt")
-    timestamp = timestamp_raw.strip()
-
-    signature_raw = payload.get("signature")
-    if not isinstance(signature_raw, str) or not signature_raw.strip():
-        return _error("Signatur fehlt")
-    signature = signature_raw.strip()
-
-    source_user = store.get_user(username)
-    if not source_user:
-        return _error("Benutzer nicht gefunden", 404)
-
-    key_material = _get_user_key_material(username)
-    if not key_material:
-        return _error("Schlüsselmaterial nicht gefunden", 500)
-    sender_public_key = key_material.get("publicKey")
-
-    resolve_by_iban = getattr(store, "get_user_by_iban", None)
-    if resolve_by_iban is None:
-        return _error("Überweisungen sind derzeit nicht möglich", 500)
-
-    target_user = resolve_by_iban(target_iban)
-    if not target_user:
-        return _error("Zielkonto existiert nicht", 404)
-
-    target_username = target_user.get("username")
-    if not target_username:
-        return _error("Zielkonto konnte nicht geladen werden", 500)
-
-    if target_username == username:
-        return _error("Zielkonto muss abweichen")
-
-    stored_first = (target_user.get("first_name") or "").strip().casefold()
-    stored_last = (target_user.get("last_name") or "").strip().casefold()
-    stored_iban = (target_user.get("iban") or "").replace(" ", "").upper()
-    if stored_iban != target_iban:
-        return _error("IBAN konnte nicht bestätigt werden")
-    if stored_first != target_first.casefold() or stored_last != target_last.casefold():
-        return _error("Empfängerdaten stimmen nicht mit der IBAN überein")
-
-    target_key_material = _get_user_key_material(target_username)
-    if not target_key_material:
-        return _error("Empfänger besitzt kein Schlüsselmaterial", 500)
-
-    receiver_public_key = target_key_material.get("publicKey")
-    amount_str = _format_amount(amount.copy_abs())
-
-    if not _verify_transaction_signature(
-        "transfer",
-        sender_public_key,
-        receiver_public_key,
-        amount_str,
-        timestamp,
-        signature,
-    ):
-        return _error("Signatur ungültig", 400)
-
-    try:
-        source_balance = store.adjust_balance(username, -amount)
-    except ValueError as exc:
-        return _error(str(exc), 400)
-    except KeyError as exc:
-        return _error(str(exc), 404)
-
-    target_balance = store.adjust_balance(target_username, amount)
-
-    source_first = (source_user.get("first_name") or "").strip()
-    source_last = (source_user.get("last_name") or "").strip()
-    source_iban = (source_user.get("iban") or "").strip()
-
-    transaction_id = _generate_transaction_id()
-
-    _persist_transaction(
-        username=username,
-        txn_type="transfer_out",
-        amount=-amount,
-        ledger_amount=amount,
-        balance=source_balance,
-        memo=f"Überweisung an {target_first} {target_last}",
-        sender_public_key=sender_public_key,
-        receiver_public_key=receiver_public_key,
-        signature=signature,
-        timestamp=timestamp,
-        transaction_id=transaction_id,
-        extra={
-            "counterpartyIban": target_iban,
-            "counterpartyName": f"{target_first} {target_last}".strip(),
-            "counterpartyPublicKey": receiver_public_key,
-        },
-    )
-    _record_account_transaction(
-        target_username,
-        "transfer_in",
-        amount,
-        target_balance,
-        f"Überweisung von {source_first} {source_last}",
-        transaction_id=transaction_id,
-        sender_public_key=sender_public_key,
-        receiver_public_key=receiver_public_key,
-        signature=signature,
-        timestamp=timestamp,
-        extra={
-            "counterpartyIban": source_iban,
-            "counterpartyName": f"{source_first} {source_last}".strip(),
-            "counterpartyPublicKey": sender_public_key,
-        },
-    )
-
-    return jsonify({"balance": _format_amount(source_balance), "transactionId": transaction_id})
-
-
-@app.post("/api/accounts/resolve")
-def account_resolve() -> Any:
-    try:
-        _require_auth()
-    except PermissionError as exc:
-        return _error(str(exc), 401)
-
-    payload = request.get_json(force=True, silent=True) or {}
-    try:
-        target_iban = _clean_iban(payload.get("targetIban"))
-    except ValueError as exc:
-        return _error(str(exc))
-
-    resolve_by_iban = getattr(store, "get_user_by_iban", None)
-    if resolve_by_iban is None:
-        return _error("Auflösung nicht verfügbar", 500)
-
-    target_user = resolve_by_iban(target_iban)
-    if not target_user:
-        return _error("Konto nicht gefunden", 404)
-
-    username = target_user.get("username")
-    if not username:
-        return _error("Konto beschädigt", 500)
-
-    key_material = _get_user_key_material(username)
-    return jsonify(
-        {
-            "accountId": username,
-            "firstName": target_user.get("first_name"),
-            "lastName": target_user.get("last_name"),
-            "publicKey": key_material.get("publicKey") if key_material else None,
-            "keyCreatedAt": key_material.get("createdAt") if key_material else None,
-        }
-    )
-
-
-@app.get("/api/transactions")
-def transactions_admin_list() -> Any:
-    try:
-        _require_ledger_token()
-    except PermissionError as exc:
-        return _ledger_error_response(exc)
-
-    try:
-        params = _TRANSACTIONS_QUERY_SCHEMA.load(request.args)
-    except ValidationError as exc:
-        return _error(_validation_error_message(exc))
-
-    partner = params.get("partner")
-    limit = params.get("limit", 100)
-    since_id = params.get("since_id")
-
-    collected: List[Dict[str, Any]] = []
-    cursor = since_id
-    batch_size = max(limit, 50)
-    safety = 0
-
-    while len(collected) < limit:
-        batch = store.list_ledger_transactions(after_transaction_id=cursor, limit=batch_size)
-        if not batch:
-            break
-        cursor = batch[-1].get("transactionId") or cursor
-        for entry in batch:
-            if partner:
-                if entry.get("senderPublicKey") != partner and entry.get("receiverPublicKey") != partner:
-                    continue
-            collected.append(entry)
-            if len(collected) >= limit:
-                break
-        if len(batch) < batch_size:
-            break
-        safety += 1
-        if safety >= 32 or cursor is None:
-            break
-
-    body: Dict[str, Any] = {"transactions": collected}
-    if collected and len(collected) == limit:
-        last_id = collected[-1].get("transactionId")
-        if last_id:
-            body["nextSinceId"] = last_id
-    return jsonify(body)
-
-
-def _collect_all_ledger_transactions(batch_size: int = 200) -> List[Dict[str, Any]]:
-    collected: List[Dict[str, Any]] = []
-    cursor: Optional[str] = None
-    while True:
-        batch = store.list_ledger_transactions(after_transaction_id=cursor, limit=batch_size)
-        if not batch:
-            break
-        collected.extend(batch)
-        cursor = batch[-1].get("transactionId")
-        if len(batch) < batch_size or not cursor:
-            break
-    return collected
-
-
-@app.get("/api/transactions/export")
-def transactions_admin_export() -> Any:
-    try:
-        _require_ledger_token()
-    except PermissionError as exc:
-        return _ledger_error_response(exc)
-
-    transactions = _collect_all_ledger_transactions()
-    return jsonify({"transactions": transactions})
-
-
-@app.post("/api/transactions")
-def transactions_admin_inject() -> Any:
-    try:
-        _require_ledger_token()
-    except PermissionError as exc:
-        return _ledger_error_response(exc)
-
-    return _error("Ledger-Schreiboperationen nutzen PUT /api/transactions/<transactionId>", 405)
-
-
-@app.put("/api/transactions/<string:transaction_id>")
-def transactions_admin_upsert(transaction_id: str) -> Any:
-    try:
-        _require_ledger_token()
-    except PermissionError as exc:
-        return _ledger_error_response(exc)
-
-    payload = request.get_json(force=True, silent=True) or {}
-    try:
-        data = _TRANSACTIONS_INJECTION_SCHEMA.load(payload)
-    except ValidationError as exc:
-        return _error(_validation_error_message(exc))
-
-    body_transaction_id = data.get("transaction_id")
-    if body_transaction_id and body_transaction_id != transaction_id:
-        return _error("transactionId widerspricht der URL", 400)
-
-    amount = Decimal(str(data["amount"]))
-    amount_str = _format_amount(amount.copy_abs())
-    timestamp = str(data["timestamp"])  # noqa: F841  # value reused in message
-    signature = data["signature"]
-
-    if not data.get("skip_signature_check"):
-        if not _verify_transaction_signature(
-            str(data["type"]),
-            str(data["sender_public_key"]),
-            str(data["receiver_public_key"]),
-            amount_str,
-            timestamp,
-            signature,
-        ):
-            return _error("Signatur ungültig", 400)
-
-    ledger_entry: Dict[str, Any] = {
-        "transactionId": transaction_id,
-        "type": data["type"],
-        "amount": amount_str,
-        "senderPublicKey": data["sender_public_key"],
-        "receiverPublicKey": data["receiver_public_key"],
-        "signature": signature,
-        "timestamp": timestamp,
-    }
-    if data.get("metadata") is not None:
-        ledger_entry["metadata"] = data["metadata"]
-
-    existing = store.get_ledger_transaction(transaction_id)
-    if existing and not data.get("allow_update"):
-        return _error("Transaktion existiert bereits", 409)
-
-    try:
-        if existing:
-            store.upsert_ledger_transaction(ledger_entry)
-            status_code = 200
-        else:
-            store.append_ledger_transaction(ledger_entry)
-            status_code = 201
-    except ValueError as exc:
-        return _error(str(exc), 400)
-
-    return jsonify({"transactionId": transaction_id, "ledgerEntry": ledger_entry}), status_code
-
-
-@app.get("/api/transactions/verify/<string:transaction_id>")
-def transactions_admin_verify(transaction_id: str) -> Any:
-    try:
-        _require_ledger_token()
-    except PermissionError as exc:
-        return _ledger_error_response(exc)
-
-    getter = getattr(store, "get_ledger_transaction", None)
-    if not callable(getter):
-        return _error("Ledger-Speicher nicht verfügbar", 503)
-
-    record = getter(transaction_id)
-    if not record:
-        return _error("Transaktion nicht gefunden", 404)
-
-    missing_fields = [
-        field
-        for field in ("type", "senderPublicKey", "receiverPublicKey", "amount", "timestamp", "signature")
-        if not record.get(field)
-    ]
-    if missing_fields:
-        return jsonify(
-            {
-                "transactionId": transaction_id,
-                "verified": False,
-                "reason": f"Felder fehlen: {', '.join(missing_fields)}",
-                "ledgerEntry": record,
-            }
-        )
-
-    amount_str = str(record.get("amount"))
-    timestamp = str(record.get("timestamp"))
-    signature = str(record.get("signature"))
-
-    verified = _verify_transaction_signature(
-        str(record.get("type")),
-        str(record.get("senderPublicKey")),
-        str(record.get("receiverPublicKey")),
-        amount_str,
-        timestamp,
-        signature,
-    )
-
-    response_body: Dict[str, Any] = {
-        "transactionId": transaction_id,
-        "verified": bool(verified),
-        "ledgerEntry": record,
-    }
-    if not verified:
-        response_body["reason"] = "Signatur ungültig"
-    return jsonify(response_body)
-
 
 @app.errorhandler(404)
 def not_found(_: Exception) -> Any:  # pragma: no cover
